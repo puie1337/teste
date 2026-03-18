@@ -42,20 +42,7 @@ local autoFireActive   = false
 local autoFireNPCActive = false
 local autoDiavoloActive = false
 local autoSummonActive = false
-
--- ──────────────────────────────────────────────
--- KILL TIMER STATE
--- ──────────────────────────────────────────────
-local killTimerEnabled    = false       -- feature toggle
-local killTimerLimit      = 60          -- seconds before resetting character
-local killTimerStart      = nil         -- tick() when boss was first seen this fight
-local killTimerLastHP     = nil         -- last recorded boss HP (to detect new spawn)
-local killTimerLabel      = nil         -- status label (assigned after GUI)
-local killTimerCountdown  = nil         -- countdown label (assigned after GUI)
-
--- Steps available in the stepper (mirrors webhook tab pattern)
-local KT_STEPS   = {10, 15, 20, 30, 45, 60, 90, 120, 180, 300}
-local ktIndex    = 6   -- default 60s
+local questActive      = false
 
 -- ──────────────────────────────────────────────
 -- WEBHOOK STATE
@@ -77,6 +64,29 @@ local standRollCount    = 0
 local standRollLabel    = nil  -- assigned after GUI
 local standStatusLabel  = nil  -- assigned after GUI
 local standMentionID    = ""   -- Discord user ID to @mention on stop alert
+local _setStandVis      = nil  -- assigned after GUI (forward ref used in roll loop)
+local questStatusLabel  = nil  -- assigned after GUI
+
+-- ──────────────────────────────────────────────
+-- BOSS KILL TIMER STATE
+-- ──────────────────────────────────────────────
+local killTimerActive   = false
+local killTimerDuration = 60
+local killTimerStart    = nil
+local killTimerLabel    = nil
+
+-- ──────────────────────────────────────────────
+-- AUTO QUEST STATE
+-- ──────────────────────────────────────────────
+local aqRunning      = false
+local aqSmartMode    = false
+local aqAttackDelay  = 0.15
+local aqTeleOffset   = Vector3.new(0, 0, 5)
+local aqAttacks      = { M1 = true, Barrage = true, Heavy = false }
+local aqActiveQuest  = { value = nil }
+local aqFarmThread   = nil
+local aqStatusLabel  = nil   -- assigned after GUI
+local aqDropBtn      = nil   -- assigned after GUI
 
 -- Stop-list (editable from GUI)
 local standStopList = {"Legendary", "Hacker", "Scourge", "Glass Cannon"}
@@ -264,80 +274,8 @@ task.spawn(function()
 end)
 
 -- ──────────────────────────────────────────────
--- KILL TIMER LOOP
+-- AUTO FIRE LOOP
 -- ──────────────────────────────────────────────
-task.spawn(function()
-	while true do
-		task.wait(0.25)
-		if not killTimerEnabled then
-			killTimerStart   = nil
-			killTimerLastHP  = nil
-			if killTimerCountdown then killTimerCountdown.Text = "OFF" end
-			continue
-		end
-
-		local model = getModel()
-		local hum   = model and getModelHumanoid(model)
-
-		if not hum or hum.Health <= 0 then
-			-- Boss dead or absent — reset tracking, no punishment
-			killTimerStart  = nil
-			killTimerLastHP = nil
-			if killTimerCountdown then
-				killTimerCountdown.Text      = "Waiting…"
-				killTimerCountdown.TextColor3= Color3.fromRGB(100, 90, 145)
-			end
-			continue
-		end
-
-		-- Detect a fresh boss spawn (HP reset upward)
-		local currentHP = hum.Health
-		if killTimerLastHP and currentHP > killTimerLastHP + 50 then
-			-- New boss or respawned boss — restart timer
-			killTimerStart = nil
-		end
-		killTimerLastHP = currentHP
-
-		-- Start the timer the moment we see a living boss
-		if not killTimerStart then
-			killTimerStart = tick()
-		end
-
-		local elapsed   = tick() - killTimerStart
-		local remaining = killTimerLimit - elapsed
-
-		if killTimerCountdown then
-			if remaining > 10 then
-				killTimerCountdown.Text      = ("⏱ %ds left"):format(math.ceil(remaining))
-				killTimerCountdown.TextColor3= Color3.fromRGB(80, 220, 180)
-			elseif remaining > 0 then
-				-- Flash red in the last 10 seconds
-				killTimerCountdown.Text      = ("⚠ %ds left"):format(math.ceil(remaining))
-				killTimerCountdown.TextColor3= Color3.fromRGB(255, 80, 80)
-			end
-		end
-
-		if remaining <= 0 then
-			-- Time's up — reset the character
-			killTimerStart  = nil
-			killTimerLastHP = nil
-			if killTimerCountdown then
-				killTimerCountdown.Text      = "💀 Resetting…"
-				killTimerCountdown.TextColor3= Color3.fromRGB(255, 80, 80)
-			end
-			pcall(function()
-				local char = getCharacter()
-				if char then
-					local hum2 = char:FindFirstChildWhichIsA("Humanoid")
-					if hum2 then hum2.Health = 0 end
-				end
-			end)
-			task.wait(3)   -- brief cooldown so we don't instantly re-trigger
-		end
-	end
-end)
-
-
 local lastAutoFire = 0
 
 task.spawn(function()
@@ -489,6 +427,313 @@ end
 
 LocalPlayer.CharacterAdded:Connect(function(char) connectSummonDeath(char) end)
 if LocalPlayer.Character then connectSummonDeath(LocalPlayer.Character) end
+
+-- ──────────────────────────────────────────────
+-- DIO QUEST LOOP
+-- ──────────────────────────────────────────────
+local function getJotaro()
+	local living = workspace:FindFirstChild("Living")
+	if not living then return nil end
+	return living:FindFirstChild("Jotaro Part 4")
+end
+
+local function isJotaroAlive()
+	local j = getJotaro()
+	if not j then return false end
+	local hum = j:FindFirstChildWhichIsA("Humanoid", true)
+	return hum and hum.Health > 0
+end
+
+local function getM1Remote()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+	local se = char:FindFirstChild("StandEvents") or char:WaitForChild("StandEvents", 1)
+	if not se then return nil end
+	return se:FindFirstChild("M1")
+end
+
+task.spawn(function()
+	while true do
+		if not questActive then
+			task.wait(0.2)
+		else
+			-- STEP 1: Fire the quest start remote
+			if questStatusLabel then questStatusLabel.Text = "Firing quest start..." end
+			pcall(function()
+				workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("DIO"):WaitForChild("Done"):FireServer()
+			end)
+			task.wait(0.5)
+
+			-- STEP 2: Wait for Jotaro to be alive
+			if questStatusLabel then questStatusLabel.Text = "Waiting for Jotaro..." end
+			local waitedFor = 0
+			while questActive and not isJotaroAlive() do
+				task.wait(0.5)
+				waitedFor += 0.5
+				if waitedFor > 30 then break end
+			end
+
+			if not questActive then task.wait(0.1) continue end
+
+			local jotaro = getJotaro()
+			if not jotaro then
+				if questStatusLabel then questStatusLabel.Text = "Jotaro not found, retrying..." end
+				task.wait(2)
+				continue
+			end
+
+			-- STEP 3: Teleport behind Jotaro
+			if questStatusLabel then questStatusLabel.Text = "Teleporting to Jotaro..." end
+			pcall(function()
+				local hrp = getRootPart()
+				local lowerTorso = workspace.Living["Jotaro Part 4"]:FindFirstChild("LowerTorso")
+				if hrp and lowerTorso then
+					hrp.CFrame = lowerTorso.CFrame * CFrame.new(0, 0, 3)
+				end
+			end)
+			task.wait(0.3)
+
+			-- STEP 4: Spam M1 until Jotaro dies
+			if questStatusLabel then questStatusLabel.Text = "Spamming M1 on Jotaro..." end
+			while questActive and isJotaroAlive() do
+				pcall(function()
+					local hrp = getRootPart()
+					local lowerTorso = workspace.Living["Jotaro Part 4"] and workspace.Living["Jotaro Part 4"]:FindFirstChild("LowerTorso")
+					if hrp and lowerTorso then
+						hrp.CFrame = lowerTorso.CFrame * CFrame.new(0, 0, 3)
+					end
+				end)
+				pcall(function()
+					local m1 = getM1Remote()
+					if m1 then m1:FireServer() end
+				end)
+				task.wait(FIRE_RATE)
+			end
+
+			if not questActive then task.wait(0.1) continue end
+
+			-- STEP 5: Fire QuestDone
+			if questStatusLabel then questStatusLabel.Text = "Jotaro dead! Firing QuestDone..." end
+			task.wait(0.3)
+			pcall(function()
+				workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("DIO"):WaitForChild("QuestDone"):FireServer()
+			end)
+			task.wait(1)
+
+			if questStatusLabel then questStatusLabel.Text = "Loop complete, restarting..." end
+			task.wait(0.5)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- BOSS KILL TIMER LOOP
+-- ──────────────────────────────────────────────
+task.spawn(function()
+	while true do
+		if killTimerActive then
+			local model = getModel()
+			local hum   = getModelHumanoid(model)
+			if hum and hum.Health > 0 then
+				if killTimerStart == nil then killTimerStart = tick() end
+				local elapsed   = tick() - killTimerStart
+				local remaining = math.max(0, killTimerDuration - math.floor(elapsed))
+				if killTimerLabel then
+					killTimerLabel.Text       = ("Kill timer: %ds left"):format(remaining)
+					killTimerLabel.TextColor3 = remaining <= 10
+						and Color3.fromRGB(255, 75, 75)
+						or  Color3.fromRGB(255, 165, 50)
+				end
+				if elapsed >= killTimerDuration then
+					killTimerStart = nil
+					if killTimerLabel then
+						killTimerLabel.Text       = "Timeout! Resetting..."
+						killTimerLabel.TextColor3 = Color3.fromRGB(255, 75, 75)
+					end
+					pcall(function()
+						local char = getCharacter()
+						if char then
+							local h = char:FindFirstChildWhichIsA("Humanoid")
+							if h then h.Health = 0 end
+						end
+					end)
+					task.wait(3)
+				end
+			else
+				killTimerStart = nil
+				if killTimerLabel then
+					killTimerLabel.Text       = "Kill timer: waiting for boss"
+					killTimerLabel.TextColor3 = Color3.fromRGB(100, 90, 145)
+				end
+			end
+			task.wait(0.5)
+		else
+			killTimerStart = nil
+			if killTimerLabel then
+				killTimerLabel.Text       = "Kill timer: OFF"
+				killTimerLabel.TextColor3 = Color3.fromRGB(65, 58, 100)
+			end
+			task.wait(0.5)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- AUTO QUEST DATA & LOGIC
+-- ──────────────────────────────────────────────
+local AQ_QUESTS = {
+	{ name = "Lvl 1  — Bad Gi",          level = 1,   enemyName = "Bad Gi",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Giorno"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Giorno"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 10 — Scary Monster",   level = 10,  enemyName = "Scary Monster",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Scared Noob"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Scared Noob"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 20 — Giorno Giovanna", level = 20,  enemyName = "Giorno Giovanna",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Koichi"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Koichi"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 30 — Rker Dummy",      level = 30,  enemyName = "Rker Dummy",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("aLLmemester"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("aLLmemester"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 40 — Yoshikage Kira",  level = 40,  enemyName = "Yoshikage Kira",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Okayasu"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Okayasu"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 50 — Dio Over Heaven", level = 50,  enemyName = "Dio Over Heaven",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Joseph Joestar"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Joseph Joestar"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 75 — Angelo",          level = 75,  enemyName = "Angelo",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Josuke"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Josuke"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 100 — Alien",          level = 100, enemyName = "Alien",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Rohan"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Rohan"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 125 — Jotaro Pt4",     level = 125, enemyName = "Jotaro Part 4",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("DIO"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("DIO"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 150 — Kakyoin",        level = 150, enemyName = "Kakyoin",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Muhammed Avdol"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Muhammed Avdol"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 175 — Jungle Bandit",  level = 175, enemyName = "Jungle Bandit",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Giorno"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Giorno"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 200 — Sewer Vampire",  level = 200, enemyName = "Sewer Vampire",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Zeppeli"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Zeppeli"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 275 — Pillerman",      level = 275, enemyName = "Pillerman",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Young Joseph"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Young Joseph"):WaitForChild("QuestDone"):FireServer() end) end },
+}
+
+local function aqGetPlayerLevel()
+	local ok, val = pcall(function() return LocalPlayer.Data.Value end)
+	if ok and type(val) == "number" then return val end
+	for _, obj in ipairs(LocalPlayer:GetDescendants()) do
+		if obj.Name == "Level" and (obj:IsA("IntValue") or obj:IsA("NumberValue")) then
+			return obj.Value
+		end
+	end
+	return 0
+end
+
+local function aqGetSmartQuest()
+	local level = aqGetPlayerLevel()
+	local best = nil
+	for _, q in ipairs(AQ_QUESTS) do
+		if q.level <= level then best = q end
+	end
+	return best
+end
+
+local function aqGetEnemies(enemyName)
+	local list = {}
+	local living = workspace:FindFirstChild("Living")
+	if not living then return list end
+	for _, obj in ipairs(living:GetChildren()) do
+		if obj.Name == enemyName then
+			local hum = obj:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health > 0 then table.insert(list, obj) end
+		end
+	end
+	return list
+end
+
+local function aqIsAlive(enemy)
+	local hum = enemy:FindFirstChildOfClass("Humanoid")
+	return hum and hum.Health > 0
+end
+
+local function aqTeleportBehind(enemy)
+	local enemyHRP = enemy:FindFirstChild("HumanoidRootPart")
+	if not enemyHRP then return end
+	local hrp = getRootPart()
+	if not hrp then return end
+	hrp.CFrame = enemyHRP.CFrame * CFrame.new(aqTeleOffset)
+end
+
+local function aqDoAttacks()
+	local char = getCharacter()
+	if not char then return end
+	local se = char:FindFirstChild("StandEvents")
+	if not se then return end
+	if aqAttacks.M1 then
+		local r = se:FindFirstChild("M1")
+		if r then pcall(function() r:FireServer() end) end
+		task.wait(aqAttackDelay)
+	end
+	if aqAttacks.Barrage then
+		local r = se:FindFirstChild("Barrage")
+		if r then pcall(function() r:FireServer(true) end) end
+		task.wait(aqAttackDelay)
+	end
+	if aqAttacks.Heavy then
+		local r = se:FindFirstChild("Heavy")
+		if r then pcall(function() r:FireServer() end) end
+		task.wait(aqAttackDelay)
+	end
+end
+
+local function aqKillEnemy(enemy)
+	while aqRunning and aqIsAlive(enemy) do
+		aqTeleportBehind(enemy)
+		aqDoAttacks()
+		task.wait(0.05)
+	end
+end
+
+local function aqRemoteLoop()
+	while aqRunning do
+		if aqActiveQuest.value then
+			aqActiveQuest.value.take()
+			aqActiveQuest.value.done()
+		end
+		task.wait(0.5)
+	end
+end
+
+local function aqRunQuest(startQuest)
+	aqActiveQuest.value = startQuest
+	task.spawn(aqRemoteLoop)
+	while aqRunning do
+		if aqSmartMode then
+			local smart = aqGetSmartQuest()
+			if smart and smart.name ~= aqActiveQuest.value.name then
+				aqActiveQuest.value = smart
+				pcall(function() aqDropBtn.Text = "▼  " .. smart.name end)
+				pcall(function() aqStatusLabel.Text = "Smart — " .. smart.name end)
+			end
+		end
+		local timeout = tick() + 120
+		repeat
+			local enemies = aqGetEnemies(aqActiveQuest.value.enemyName)
+			if #enemies > 0 then
+				aqKillEnemy(enemies[1])
+				task.wait(0.2)
+			else
+				task.wait(0.3)
+			end
+		until not aqRunning or tick() > timeout
+		task.wait(0.2)
+	end
+end
 
 -- ──────────────────────────────────────────────
 -- INVENTORY WEBHOOK
@@ -751,6 +996,22 @@ local THEME = {
         good = Color3.fromRGB( 80, 255, 155),
         bad  = Color3.fromRGB(255,  80,  80),
     },
+    quest = {    -- 📜  Neon Green
+        pri  = Color3.fromRGB( 50, 220,  90),
+        glow = Color3.fromRGB(100, 255, 140),
+        text = Color3.fromRGB(190, 255, 210),
+        sub  = Color3.fromRGB(130, 200, 155),
+        good = Color3.fromRGB( 80, 255, 155),
+        bad  = Color3.fromRGB(255,  80,  80),
+    },
+    autoquest = {  -- ⚡  Crimson / Ember (same red family as spam tab)
+        pri  = Color3.fromRGB(230,  55,  75),
+        glow = Color3.fromRGB(255, 110,  90),
+        text = Color3.fromRGB(255, 200, 195),
+        sub  = Color3.fromRGB(190, 130, 125),
+        good = Color3.fromRGB( 80, 255, 155),
+        bad  = Color3.fromRGB(255,  75,  75),
+    },
 }
 
 -- ────────────────────────────────────────────────────────────
@@ -939,7 +1200,7 @@ local function makeTabPill(name, icon, order)
     btn.BackgroundColor3    = Color3.new(0,0,0)
     btn.BackgroundTransparency = 1
     btn.BorderSizePixel     = 0
-    btn.Size                = UDim2.new(0.25, 0, 1, 0)
+    btn.Size                = UDim2.new(0.20, 0, 1, 0)
     btn.LayoutOrder         = order
     btn.Parent              = tabBg
 
@@ -967,9 +1228,11 @@ local function makeTabPill(name, icon, order)
     return btn
 end
 
-local spamTabBtn    = makeTabPill("spam",    "⚔  Spammer",   1)
-local webhookTabBtn = makeTabPill("webhook", "🔔  Webhook",   2)
-local standTabBtn   = makeTabPill("stand",   "★  Stand Roll", 3)
+local spamTabBtn    = makeTabPill("spam",      "⚔  Spammer",    1)
+local webhookTabBtn = makeTabPill("webhook",   "🔔  Webhook",    2)
+local standTabBtn   = makeTabPill("stand",     "★  Stand Roll",  3)
+local questTabBtn   = makeTabPill("quest",     "📜  Quests",     4)
+local aqTabBtn      = makeTabPill("autoquest", "⚡  Auto Quest", 5)
 
 -- ────────────────────────────────────────────────────────────
 --  SCROLLABLE BODY
@@ -1356,147 +1619,90 @@ summonCountLabel.LayoutOrder         = 11
 summonCountLabel.TextXAlignment      = Enum.TextXAlignment.Right
 summonCountLabel.Parent              = spamContent
 
--- ── Kill Timer Section ───────────────────────────────────────
-makeSection(spamContent, "Kill Timer — Auto-Reset", 12, TS.pri)
+-- ── Kill Timer section ───────────────────────────────────────
+makeSection(spamContent, "Kill Timer  (auto-reset on timeout)", 12, TS.pri)
 
--- Toggle row
-local ktRow = makeRow(spamContent, "Kill Timer:", 13, TS.pri)
-killTimerLabel = makeStateBadge(ktRow)
-local ktToggleBtn, setKTVis = makeToggle(ktRow, false, TS.pri)
-ktToggleBtn.MouseButton1Click:Connect(function()
-    killTimerEnabled = not killTimerEnabled
-    setKTVis(killTimerEnabled)
-    killTimerLabel.Text       = killTimerEnabled and "ON" or "OFF"
-    killTimerLabel.TextColor3 = killTimerEnabled and TS.bad or DIM
-    if not killTimerEnabled then
-        killTimerStart  = nil
-        killTimerLastHP = nil
+local killTimerRow = makeRow(spamContent, "Kill Timer:", 13, TS.pri)
+local killTimerStateLabel = makeStateBadge(killTimerRow)
+local killTimerToggleBtn, setKillTimerVis = makeToggle(killTimerRow, false, TS.pri)
+killTimerToggleBtn.MouseButton1Click:Connect(function()
+    killTimerActive = not killTimerActive
+    setKillTimerVis(killTimerActive)
+    killTimerStateLabel.Text       = killTimerActive and "ON" or "OFF"
+    killTimerStateLabel.TextColor3 = killTimerActive and TS.bad or DIM
+    if not killTimerActive then killTimerStart = nil end
+end)
+
+local killDurRow = Instance.new("Frame")
+killDurRow.Size             = UDim2.new(1, 0, 0, 38)
+killDurRow.BackgroundColor3 = CARD
+killDurRow.BorderSizePixel  = 0
+killDurRow.LayoutOrder      = 14
+killDurRow.Parent           = spamContent
+corner(10, killDurRow); newStroke(TS.pri, 0.9, killDurRow)
+
+local kdMinusBtn = Instance.new("TextButton")
+kdMinusBtn.Text = "−"; kdMinusBtn.Font = Enum.Font.GothamBold; kdMinusBtn.TextSize = 18
+kdMinusBtn.TextColor3 = WHITE; kdMinusBtn.BackgroundColor3 = CARD; kdMinusBtn.BorderSizePixel = 0
+kdMinusBtn.Size = UDim2.new(0, 34, 0, 28); kdMinusBtn.Position = UDim2.new(0, 8, 0.5, -14)
+kdMinusBtn.Parent = killDurRow
+corner(8, kdMinusBtn); newStroke(TS.pri, 1, kdMinusBtn)
+kdMinusBtn.MouseEnter:Connect(function() tw(kdMinusBtn, 0.12, {BackgroundColor3 = TS.pri}) end)
+kdMinusBtn.MouseLeave:Connect(function() tw(kdMinusBtn, 0.12, {BackgroundColor3 = CARD}) end)
+
+local kdPlusBtn = Instance.new("TextButton")
+kdPlusBtn.Text = "+"; kdPlusBtn.Font = Enum.Font.GothamBold; kdPlusBtn.TextSize = 18
+kdPlusBtn.TextColor3 = WHITE; kdPlusBtn.BackgroundColor3 = CARD; kdPlusBtn.BorderSizePixel = 0
+kdPlusBtn.Size = UDim2.new(0, 34, 0, 28); kdPlusBtn.Position = UDim2.new(1, -42, 0.5, -14)
+kdPlusBtn.Parent = killDurRow
+corner(8, kdPlusBtn); newStroke(TS.pri, 1, kdPlusBtn)
+kdPlusBtn.MouseEnter:Connect(function() tw(kdPlusBtn, 0.12, {BackgroundColor3 = TS.pri}) end)
+kdPlusBtn.MouseLeave:Connect(function() tw(kdPlusBtn, 0.12, {BackgroundColor3 = CARD}) end)
+
+local kdLabel = Instance.new("TextButton")
+kdLabel.Text = "60s"; kdLabel.Font = Enum.Font.GothamBold; kdLabel.TextSize = 18
+kdLabel.TextColor3 = TS.text; kdLabel.BackgroundTransparency = 1; kdLabel.BorderSizePixel = 0
+kdLabel.Size = UDim2.new(1, -100, 1, 0); kdLabel.Position = UDim2.new(0, 50, 0, 0)
+kdLabel.TextXAlignment = Enum.TextXAlignment.Center; kdLabel.Parent = killDurRow
+
+local kdEditBox = Instance.new("TextBox")
+kdEditBox.Text = ""; kdEditBox.Font = Enum.Font.GothamBold; kdEditBox.TextSize = 18
+kdEditBox.TextColor3 = TS.text; kdEditBox.PlaceholderText = "type secs…"
+kdEditBox.PlaceholderColor3 = DIM; kdEditBox.BackgroundColor3 = INPUTBG
+kdEditBox.BorderSizePixel = 0; kdEditBox.ClearTextOnFocus = true; kdEditBox.Visible = false
+kdEditBox.Size = UDim2.new(1, -100, 1, 0); kdEditBox.Position = UDim2.new(0, 50, 0, 0)
+kdEditBox.TextXAlignment = Enum.TextXAlignment.Center; kdEditBox.Parent = killDurRow
+corner(6, kdEditBox); newStroke(TS.pri, 1.2, kdEditBox)
+
+kdLabel.MouseButton1Click:Connect(function()
+    kdLabel.Visible = false; kdEditBox.Visible = true
+    kdEditBox.Text = ""; kdEditBox:CaptureFocus()
+end)
+kdEditBox.FocusLost:Connect(function(entered)
+    local v = tonumber(kdEditBox.Text)
+    if entered and v and v >= 1 then
+        killTimerDuration = math.floor(v)
+        kdLabel.Text = tostring(killTimerDuration) .. "s"
     end
+    kdEditBox.Visible = false; kdLabel.Visible = true; kdEditBox.Text = ""
 end)
 
--- Stepper row (same pattern as webhook interval)
-local ktStepRow = Instance.new("Frame")
-ktStepRow.Size             = UDim2.new(1, 0, 0, 38)
-ktStepRow.BackgroundColor3 = CARD
-ktStepRow.BorderSizePixel  = 0
-ktStepRow.LayoutOrder      = 14
-ktStepRow.Parent           = spamContent
-corner(10, ktStepRow); newStroke(TS.pri, 0.9, ktStepRow)
-
--- − button
-local ktMinusBtn = Instance.new("TextButton")
-ktMinusBtn.Text             = "−"
-ktMinusBtn.Font             = Enum.Font.GothamBold
-ktMinusBtn.TextSize         = 18
-ktMinusBtn.TextColor3       = WHITE
-ktMinusBtn.BackgroundColor3 = CARD
-ktMinusBtn.BorderSizePixel  = 0
-ktMinusBtn.Size             = UDim2.new(0, 34, 0, 28)
-ktMinusBtn.Position         = UDim2.new(0, 8, 0.5, -14)
-ktMinusBtn.Parent           = ktStepRow
-corner(8, ktMinusBtn); newStroke(TS.pri, 1, ktMinusBtn)
-ktMinusBtn.MouseEnter:Connect(function() tw(ktMinusBtn, 0.12, {BackgroundColor3 = TS.pri}) end)
-ktMinusBtn.MouseLeave:Connect(function() tw(ktMinusBtn, 0.12, {BackgroundColor3 = CARD}) end)
-
--- + button
-local ktPlusBtn = Instance.new("TextButton")
-ktPlusBtn.Text             = "+"
-ktPlusBtn.Font             = Enum.Font.GothamBold
-ktPlusBtn.TextSize         = 18
-ktPlusBtn.TextColor3       = WHITE
-ktPlusBtn.BackgroundColor3 = CARD
-ktPlusBtn.BorderSizePixel  = 0
-ktPlusBtn.Size             = UDim2.new(0, 34, 0, 28)
-ktPlusBtn.Position         = UDim2.new(1, -42, 0.5, -14)
-ktPlusBtn.Parent           = ktStepRow
-corner(8, ktPlusBtn); newStroke(TS.pri, 1, ktPlusBtn)
-ktPlusBtn.MouseEnter:Connect(function() tw(ktPlusBtn, 0.12, {BackgroundColor3 = TS.pri}) end)
-ktPlusBtn.MouseLeave:Connect(function() tw(ktPlusBtn, 0.12, {BackgroundColor3 = CARD}) end)
-
--- Centre display label (clickable → type custom value)
-local ktValLabel = Instance.new("TextButton")
-ktValLabel.Text               = "60s"
-ktValLabel.Font               = Enum.Font.GothamBold
-ktValLabel.TextSize           = 18
-ktValLabel.TextColor3         = TS.text
-ktValLabel.BackgroundTransparency = 1
-ktValLabel.BorderSizePixel    = 0
-ktValLabel.Size               = UDim2.new(1, -100, 1, 0)
-ktValLabel.Position           = UDim2.new(0, 50, 0, 0)
-ktValLabel.TextXAlignment     = Enum.TextXAlignment.Center
-ktValLabel.Parent             = ktStepRow
-
--- Hidden edit box
-local ktEditBox = Instance.new("TextBox")
-ktEditBox.Text               = ""
-ktEditBox.Font               = Enum.Font.GothamBold
-ktEditBox.TextSize           = 18
-ktEditBox.TextColor3         = TS.text
-ktEditBox.PlaceholderText    = "type secs…"
-ktEditBox.PlaceholderColor3  = DIM
-ktEditBox.BackgroundColor3   = INPUTBG
-ktEditBox.BorderSizePixel    = 0
-ktEditBox.ClearTextOnFocus   = true
-ktEditBox.Visible            = false
-ktEditBox.Size               = UDim2.new(1, -100, 1, 0)
-ktEditBox.Position           = UDim2.new(0, 50, 0, 0)
-ktEditBox.TextXAlignment     = Enum.TextXAlignment.Center
-ktEditBox.Parent             = ktStepRow
-corner(6, ktEditBox); newStroke(TS.pri, 1.2, ktEditBox)
-
-ktValLabel.MouseButton1Click:Connect(function()
-    ktValLabel.Visible = false
-    ktEditBox.Visible  = true
-    ktEditBox.Text     = ""
-    ktEditBox:CaptureFocus()
-end)
-ktEditBox.FocusLost:Connect(function(entered)
-    local v = tonumber(ktEditBox.Text)
-    if entered and v and v >= 5 then
-        killTimerLimit  = math.floor(v)
-        ktValLabel.Text = tostring(killTimerLimit) .. "s"
-    end
-    ktEditBox.Visible  = false
-    ktValLabel.Visible = true
-    ktEditBox.Text     = ""
-end)
-
-local function updateKTLabel()
-    killTimerLimit  = KT_STEPS[ktIndex]
-    ktValLabel.Text = tostring(killTimerLimit) .. "s"
+local KD_STEPS = {15, 30, 45, 60, 90, 120, 180, 300, 600}
+local kdIndex = 4
+local function updateKdLabel()
+    kdLabel.Text = tostring(KD_STEPS[kdIndex]) .. "s"
+    killTimerDuration = KD_STEPS[kdIndex]
 end
-ktMinusBtn.MouseButton1Click:Connect(function()
-    if ktIndex > 1 then ktIndex -= 1; updateKTLabel() end
+kdMinusBtn.MouseButton1Click:Connect(function()
+    if kdIndex > 1 then kdIndex -= 1; updateKdLabel() end
 end)
-ktPlusBtn.MouseButton1Click:Connect(function()
-    if ktIndex < #KT_STEPS then ktIndex += 1; updateKTLabel() end
+kdPlusBtn.MouseButton1Click:Connect(function()
+    if kdIndex < #KD_STEPS then kdIndex += 1; updateKdLabel() end
 end)
 
--- Countdown status pill
-local ktStatusBar = Instance.new("Frame")
-ktStatusBar.Size             = UDim2.new(1, 0, 0, 28)
-ktStatusBar.BackgroundColor3 = INPUTBG
-ktStatusBar.BorderSizePixel  = 0
-ktStatusBar.LayoutOrder      = 15
-ktStatusBar.Parent           = spamContent
-corner(9, ktStatusBar); newStroke(TS.pri, 0.8, ktStatusBar)
-local ktDot = Instance.new("Frame")
-ktDot.Size             = UDim2.new(0, 7, 0, 7)
-ktDot.Position         = UDim2.new(0, 9, 0.5, -3.5)
-ktDot.BackgroundColor3 = TS.pri
-ktDot.BorderSizePixel  = 0
-ktDot.Parent           = ktStatusBar
-corner(4, ktDot)
-killTimerCountdown = Instance.new("TextLabel")
-killTimerCountdown.Text               = "OFF"
-killTimerCountdown.Font               = Enum.Font.GothamBold
-killTimerCountdown.TextSize           = 11
-killTimerCountdown.TextColor3         = DIM
-killTimerCountdown.BackgroundTransparency = 1
-killTimerCountdown.Size               = UDim2.new(1, -24, 1, 0)
-killTimerCountdown.Position           = UDim2.new(0, 22, 0, 0)
-killTimerCountdown.TextXAlignment     = Enum.TextXAlignment.Left
-killTimerCountdown.Parent             = ktStatusBar
+local killTimerPillLbl, killTimerPillDot = makeStatusPill(spamContent, 15, TS.pri)
+killTimerPillLbl.Text = "Kill timer: OFF"
+killTimerLabel = killTimerPillLbl
 
 local statusTxt, statusDot = makeStatusPill(spamContent, 16, TS.pri)
 statusTxt.Text = "Boss: searching..."
@@ -1791,10 +1997,224 @@ end)
 standStatusLabel = makeStatusPill(standContent, 11, TR.pri)
 standStatusLabel.Text = "Idle"
 
+-- ════════════════════════════════════════════════════════════
+--  📜  QUESTS TAB  —  Neon Green
+-- ════════════════════════════════════════════════════════════
+local TQ = THEME.quest
+local questContent = makeContentFrame(bodyArea)
+
+makeSection(questContent, "DIO Quest — Jotaro Part 4", 1, TQ.pri)
+
+-- Description card
+local questDescFrame = Instance.new("Frame")
+questDescFrame.Size             = UDim2.new(1, 0, 0, 0)
+questDescFrame.AutomaticSize    = Enum.AutomaticSize.Y
+questDescFrame.BackgroundColor3 = CARD
+questDescFrame.BorderSizePixel  = 0
+questDescFrame.LayoutOrder      = 2
+questDescFrame.Parent           = questContent
+corner(8, questDescFrame)
+newStroke(TQ.pri, 0.8, questDescFrame)
+local questDescPad = Instance.new("UIPadding")
+questDescPad.PaddingTop    = UDim.new(0, 8); questDescPad.PaddingBottom = UDim.new(0, 8)
+questDescPad.PaddingLeft   = UDim.new(0, 10); questDescPad.PaddingRight  = UDim.new(0, 10)
+questDescPad.Parent = questDescFrame
+
+local questDesc = Instance.new("TextLabel")
+questDesc.Text               = "Fires quest start → waits for Jotaro to be alive → teleports behind him → spams M1 until he dies → fires QuestDone → loops until toggled off."
+questDesc.Font               = Enum.Font.Gotham
+questDesc.TextSize           = 10
+questDesc.TextColor3         = TQ.sub
+questDesc.BackgroundTransparency = 1
+questDesc.Size               = UDim2.new(1, 0, 0, 0)
+questDesc.AutomaticSize      = Enum.AutomaticSize.Y
+questDesc.TextWrapped        = true
+questDesc.TextXAlignment     = Enum.TextXAlignment.Left
+questDesc.Parent             = questDescFrame
+
+makeSection(questContent, "Auto Quest", 3, TQ.pri)
+
+local questRow = makeRow(questContent, "Auto DIO Quest:", 4, TQ.pri)
+local questStateLabel = makeStateBadge(questRow)
+local questToggleBtn, setQuestVis = makeToggle(questRow, false, TQ.pri)
+
+questToggleBtn.MouseButton1Click:Connect(function()
+    questActive = not questActive
+    setQuestVis(questActive)
+    questStateLabel.Text      = questActive and "ON" or "OFF"
+    questStateLabel.TextColor3= questActive and TQ.good or DIM
+    if questActive then
+        if questStatusLabel then questStatusLabel.Text = "Starting quest loop..." end
+    else
+        if questStatusLabel then questStatusLabel.Text = "Stopped." end
+    end
+end)
+
+questStatusLabel = makeStatusPill(questContent, 5, TQ.pri)
+questStatusLabel.Text = "Idle"
+
+-- ════════════════════════════════════════════════════════════
+--  ⚡  AUTO QUEST TAB  —  Crimson / Ember
+-- ════════════════════════════════════════════════════════════
+local TAQ = THEME.autoquest
+local aqContent = makeContentFrame(bodyArea)
+
+makeSection(aqContent, "Quest Selector", 1, TAQ.pri)
+
+aqDropBtn = Instance.new("TextButton")
+aqDropBtn.Text = "▼  Choose a Quest..."; aqDropBtn.Font = Enum.Font.Gotham
+aqDropBtn.TextSize = 12; aqDropBtn.TextColor3 = TAQ.text
+aqDropBtn.BackgroundColor3 = CARD; aqDropBtn.BorderSizePixel = 0
+aqDropBtn.Size = UDim2.new(1, 0, 0, 34); aqDropBtn.LayoutOrder = 2
+aqDropBtn.TextXAlignment = Enum.TextXAlignment.Left; aqDropBtn.Parent = aqContent
+corner(9, aqDropBtn); newStroke(TAQ.pri, 1, aqDropBtn); pad(0, 0, 10, 10, aqDropBtn)
+
+local aqDropList = Instance.new("ScrollingFrame")
+aqDropList.Size = UDim2.new(1, 0, 0, 0); aqDropList.BackgroundColor3 = INPUTBG
+aqDropList.BorderSizePixel = 0; aqDropList.ScrollBarThickness = 3
+aqDropList.ScrollBarImageColor3 = TAQ.pri; aqDropList.ClipsDescendants = true
+aqDropList.Visible = false; aqDropList.LayoutOrder = 3; aqDropList.ZIndex = 10
+aqDropList.Parent = aqContent
+corner(8, aqDropList); newStroke(TAQ.pri, 0.8, aqDropList)
+
+local aqDropLayout = Instance.new("UIListLayout")
+aqDropLayout.SortOrder = Enum.SortOrder.LayoutOrder; aqDropLayout.Parent = aqDropList
+
+local aqDropOpen = false
+for i, quest in ipairs(AQ_QUESTS) do
+    local item = Instance.new("TextButton")
+    item.Size = UDim2.new(1, 0, 0, 30); item.BackgroundColor3 = CARD
+    item.BackgroundTransparency = 0.3; item.Text = "  " .. quest.name
+    item.TextColor3 = TAQ.text; item.Font = Enum.Font.Gotham; item.TextSize = 11
+    item.TextXAlignment = Enum.TextXAlignment.Left; item.BorderSizePixel = 0
+    item.LayoutOrder = i; item.ZIndex = 11; item.Parent = aqDropList
+    item.MouseEnter:Connect(function()
+        tw(item, 0.1, {BackgroundColor3 = TAQ.pri, BackgroundTransparency = 0.6})
+    end)
+    item.MouseLeave:Connect(function()
+        tw(item, 0.1, {BackgroundColor3 = CARD, BackgroundTransparency = 0.3})
+    end)
+    item.MouseButton1Click:Connect(function()
+        aqActiveQuest.value = quest
+        pcall(function() aqDropBtn.Text = "▼  " .. quest.name end)
+        aqDropOpen = false; aqDropList.Visible = false
+        tw(aqDropList, 0.18, {Size = UDim2.new(1, 0, 0, 0)})
+    end)
+end
+aqDropList.CanvasSize = UDim2.new(0, 0, 0, #AQ_QUESTS * 30)
+
+aqDropBtn.MouseButton1Click:Connect(function()
+    aqDropOpen = not aqDropOpen
+    aqDropList.Visible = true
+    local targetH = aqDropOpen and math.min(#AQ_QUESTS * 30, 150) or 0
+    tw(aqDropList, 0.18, {Size = UDim2.new(1, 0, 0, targetH)})
+    if not aqDropOpen then
+        task.delay(0.2, function() aqDropList.Visible = false end)
+    end
+end)
+
+makeSection(aqContent, "Attack Config", 4, TAQ.pri)
+
+local aqAtkDefs = {
+    { key = "M1",      label = "M1 Punch",   icon = "👊" },
+    { key = "Barrage", label = "Barrage",     icon = "⚡" },
+    { key = "Heavy",   label = "Heavy Punch", icon = "💥" },
+}
+local aqAtkOrder = 5
+for _, atk in ipairs(aqAtkDefs) do
+    local row = makeRow(aqContent, atk.icon .. "  " .. atk.label, aqAtkOrder, TAQ.pri)
+    local badge = makeStateBadge(row)
+    badge.Text = aqAttacks[atk.key] and "ON" or "OFF"
+    badge.TextColor3 = aqAttacks[atk.key] and TAQ.good or DIM
+    local atkBtn, setAtkVis = makeToggle(row, aqAttacks[atk.key], TAQ.pri)
+    atkBtn.MouseButton1Click:Connect(function()
+        aqAttacks[atk.key] = not aqAttacks[atk.key]
+        setAtkVis(aqAttacks[atk.key])
+        badge.Text = aqAttacks[atk.key] and "ON" or "OFF"
+        badge.TextColor3 = aqAttacks[atk.key] and TAQ.good or DIM
+    end)
+    aqAtkOrder += 1
+end
+
+makeSection(aqContent, "Smart Mode", aqAtkOrder, TAQ.pri)
+aqAtkOrder += 1
+
+local aqSmartRow = makeRow(aqContent, "🧠  Auto-pick by level:", aqAtkOrder, TAQ.pri)
+local aqSmartBadge = makeStateBadge(aqSmartRow)
+aqSmartBadge.Text = "OFF"
+local aqSmartBtn, setSmartVis = makeToggle(aqSmartRow, false, TAQ.pri)
+aqSmartBtn.MouseButton1Click:Connect(function()
+    aqSmartMode = not aqSmartMode
+    setSmartVis(aqSmartMode)
+    aqSmartBadge.Text = aqSmartMode and "ON" or "OFF"
+    aqSmartBadge.TextColor3 = aqSmartMode and TAQ.good or DIM
+    if aqSmartMode then
+        local smart = aqGetSmartQuest()
+        if smart then
+            aqActiveQuest.value = smart
+            pcall(function() aqDropBtn.Text = "▼  " .. smart.name end)
+        end
+    end
+end)
+aqAtkOrder += 1
+
+makeSection(aqContent, "Farming", aqAtkOrder, TAQ.pri)
+aqAtkOrder += 1
+
+local aqStartBtn = makeActionBtn(aqContent, "▶  START FARMING", aqAtkOrder,
+    Color3.fromRGB(180, 30, 50), TAQ.pri)
+aqAtkOrder += 1
+
+aqStartBtn.MouseButton1Click:Connect(function()
+    if aqRunning then
+        aqRunning = false
+        if aqFarmThread then task.cancel(aqFarmThread); aqFarmThread = nil end
+        aqStartBtn.Text = "▶  START FARMING"
+        tw(aqStartBtn, 0.2, {BackgroundColor3 = Color3.fromRGB(180, 30, 50)})
+        if aqStatusLabel then aqStatusLabel.Text = "Idle"; aqStatusLabel.TextColor3 = MUTED end
+    else
+        if aqSmartMode then
+            local smart = aqGetSmartQuest()
+            if smart then
+                aqActiveQuest.value = smart
+                pcall(function() aqDropBtn.Text = "▼  " .. smart.name end)
+            else
+                if aqStatusLabel then
+                    aqStatusLabel.Text = "⚠ Level too low for any quest!"
+                    aqStatusLabel.TextColor3 = TAQ.bad
+                end
+                return
+            end
+        else
+            if not aqActiveQuest.value then
+                if aqStatusLabel then
+                    aqStatusLabel.Text = "⚠ Select a quest first!"
+                    aqStatusLabel.TextColor3 = TAQ.bad
+                end
+                return
+            end
+        end
+        aqRunning = true
+        aqStartBtn.Text = "⏹  STOP FARMING"
+        tw(aqStartBtn, 0.2, {BackgroundColor3 = Color3.fromRGB(100, 20, 35)})
+        if aqStatusLabel then
+            local prefix = aqSmartMode and "Smart — " or "Farming — "
+            aqStatusLabel.Text = prefix .. (aqActiveQuest.value and aqActiveQuest.value.name or "?")
+            aqStatusLabel.TextColor3 = TAQ.good
+        end
+        aqFarmThread = task.spawn(function() aqRunQuest(aqActiveQuest.value) end)
+    end
+end)
+
+aqStatusLabel = makeStatusPill(aqContent, aqAtkOrder, TAQ.pri)
+aqStatusLabel.Text = "Idle"
+
 local function switchTab(tab)
     spamContent.Visible    = (tab == "spam")
     webhookContent.Visible = (tab == "webhook")
     standContent.Visible   = (tab == "stand")
+    questContent.Visible   = (tab == "quest")
+    aqContent.Visible      = (tab == "autoquest")
 
     local th = THEME[tab]
 
@@ -1816,9 +2236,11 @@ end
 
 switchTab("spam")   -- start on spam tab
 
-spamTabBtn.MouseButton1Click:Connect(function()    switchTab("spam")    end)
-webhookTabBtn.MouseButton1Click:Connect(function() switchTab("webhook") end)
-standTabBtn.MouseButton1Click:Connect(function()   switchTab("stand")   end)
+spamTabBtn.MouseButton1Click:Connect(function()    switchTab("spam")       end)
+webhookTabBtn.MouseButton1Click:Connect(function() switchTab("webhook")    end)
+standTabBtn.MouseButton1Click:Connect(function()   switchTab("stand")      end)
+questTabBtn.MouseButton1Click:Connect(function()   switchTab("quest")      end)
+aqTabBtn.MouseButton1Click:Connect(function()      switchTab("autoquest")  end)
 
 -- ════════════════════════════════════════════════════════════
 --  MINIMIZE / CLOSE
@@ -1845,8 +2267,9 @@ end)
 closeBtn.MouseButton1Click:Connect(function()
     spamActive = false; goActive = false; autoFireActive = false
     autoSummonActive = false; webhookActive = false; standRollActive = false
-    autoFireNPCActive = false; autoDiavoloActive = false
-    killTimerEnabled = false; killTimerStart = nil; killTimerLastHP = nil
+    questActive = false; autoFireNPCActive = false; autoDiavoloActive = false
+    killTimerActive = false; killTimerStart = nil
+    aqRunning = false; if aqFarmThread then task.cancel(aqFarmThread) end
     if summonDeathConn then summonDeathConn:Disconnect() end
     tw(frame,     0.18, {BackgroundTransparency = 1})
     tw(glowFrame, 0.18, {BackgroundTransparency = 1})
