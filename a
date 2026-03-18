@@ -1,0 +1,2326 @@
+-- v3-fixed
+-- ══════════════════════════════════════════════
+-- All-in-One Script: Boss Spammer + Webhook + Stand Auto-Roll
+-- Tabs: ⚔ Spammer | 🔔 Webhook | ✦ Stand Roll
+-- Anti-AFK runs silently in the background (no tab)
+-- ══════════════════════════════════════════════
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
+local VirtualUser      = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ──────────────────────────────────────────────
+-- ANTI-AFK (silent, always on)
+-- ──────────────────────────────────────────────
+LocalPlayer.Idled:Connect(function()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+end)
+
+-- ──────────────────────────────────────────────
+-- BOSS SPAMMER CONFIG
+-- ──────────────────────────────────────────────
+local STUDS_BEHIND = 8
+local FIRE_RATE    = 0.05
+local TWEEN_TIME   = 0.3
+
+-- ──────────────────────────────────────────────
+-- BOSS SPAMMER STATE
+-- ──────────────────────────────────────────────
+local useTween         = true
+local goActive         = false
+local spamActive       = false
+local autoFireActive   = false
+local autoFireNPCActive = false
+local autoDiavoloActive = false
+local autoSummonActive = false
+local questActive      = false
+
+-- ──────────────────────────────────────────────
+-- WEBHOOK STATE
+-- ──────────────────────────────────────────────
+local webhookURL        = "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE"
+local webhookInterval   = 60
+local webhookActive     = false
+local lastWebhookSend   = 0
+local webhookSendCount  = 0
+local webhookCountLabel = nil  -- assigned after GUI
+
+-- ──────────────────────────────────────────────
+-- STAND AUTO-ROLL STATE
+-- ──────────────────────────────────────────────
+local standRollActive   = false
+local standWebhookURL   = "https://discord.com/api/webhooks/YOUR_STAND_WEBHOOK_HERE"
+local standLoopCooldown = 5
+local standRollCount    = 0
+local standRollLabel    = nil  -- assigned after GUI
+local standStatusLabel  = nil  -- assigned after GUI
+local standMentionID    = ""   -- Discord user ID to @mention on stop alert
+local _setStandVis      = nil  -- assigned after GUI (forward ref used in roll loop)
+local questStatusLabel  = nil  -- assigned after GUI
+
+-- ──────────────────────────────────────────────
+-- BOSS KILL TIMER STATE
+-- ──────────────────────────────────────────────
+local killTimerActive   = false
+local killTimerDuration = 60
+local killTimerStart    = nil
+local killTimerLabel    = nil
+
+-- ──────────────────────────────────────────────
+-- AUTO QUEST STATE
+-- ──────────────────────────────────────────────
+local aqRunning      = false
+local aqSmartMode    = false
+local aqAttackDelay  = 0.15
+local aqTeleOffset   = Vector3.new(0, 0, 5)
+local aqAttacks      = { M1 = true, Barrage = true, Heavy = false }
+local aqActiveQuest  = { value = nil }
+local aqFarmThread   = nil
+local aqStatusLabel  = nil   -- assigned after GUI
+local aqDropBtn      = nil   -- assigned after GUI
+
+-- Stop-list (editable from GUI)
+local standStopList = {"Legendary", "Hacker", "Scourge", "Glass Cannon"}
+
+-- Attribute label reference (fetched lazily)
+local attrLabel = nil
+local function getAttrLabel()
+	if attrLabel then return attrLabel end
+	pcall(function()
+		attrLabel = LocalPlayer
+			:WaitForChild("PlayerGui", 5)
+			:WaitForChild("newStatsGUI", 5)
+			:WaitForChild("StatsMenu", 5)
+			:WaitForChild("AttributeName", 5)
+			:WaitForChild("_Background", 5)
+			:WaitForChild("TextLabel", 5)
+	end)
+	return attrLabel
+end
+
+-- Stand name label reference (fetched lazily)
+local standNameLabel = nil
+local function getStandNameLabel()
+	if standNameLabel then return standNameLabel end
+	pcall(function()
+		standNameLabel = LocalPlayer
+			:WaitForChild("PlayerGui", 5)
+			:WaitForChild("newStatsGUI", 5)
+			:WaitForChild("StatsMenu", 5)
+			:WaitForChild("StandName", 5)
+			:WaitForChild("_Background", 5)
+			:WaitForChild("TextLabel", 5)
+	end)
+	return standNameLabel
+end
+
+-- UseItem remote (fetched lazily)
+local useItemEvent = nil
+local function getUseEvent()
+	if useItemEvent then return useItemEvent end
+	pcall(function()
+		useItemEvent = ReplicatedStorage
+			:WaitForChild("Events", 5)
+			:WaitForChild("UseItem", 5)
+	end)
+	return useItemEvent
+end
+
+-- ──────────────────────────────────────────────
+-- BOSS HELPERS
+-- ──────────────────────────────────────────────
+local function getModel()
+	local living = game.workspace:FindFirstChild("Living")
+	if not living then return nil end
+	return living:FindFirstChild("Boss")
+end
+
+local function getModelHumanoid(model)
+	if not model then return nil end
+	return model:FindFirstChildWhichIsA("Humanoid", true)
+end
+
+local function getCharacter()
+	return LocalPlayer.Character
+end
+
+local function getRootPart()
+	local char = getCharacter()
+	if not char then return nil end
+	return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getBehindCFrame(model)
+	local root = model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChildWhichIsA("BasePart")
+	if not root then return nil end
+	return root.CFrame * CFrame.new(0, 0, STUDS_BEHIND)
+end
+
+-- ──────────────────────────────────────────────
+-- MOVEMENT
+-- ──────────────────────────────────────────────
+local activeTween = nil
+
+local function moveBehindBoss()
+	local model = getModel()
+	if not model then return end
+	local targetCF = getBehindCFrame(model)
+	if not targetCF then return end
+	local hrp = getRootPart()
+	if not hrp then return end
+
+	if useTween then
+		if activeTween then activeTween:Cancel() end
+		local info = TweenInfo.new(TWEEN_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		activeTween = TweenService:Create(hrp, info, {CFrame = targetCF})
+		activeTween:Play()
+	else
+		hrp.CFrame = targetCF
+	end
+end
+
+-- ──────────────────────────────────────────────
+-- SELECTABLE REMOTE SPAMMER
+-- ──────────────────────────────────────────────
+
+-- Table of available remotes. "selected" is toggled from the GUI.
+local SPAM_REMOTES = {
+	{ id = "M1",      label = "M1",      selected = true,  fire = function()
+		local char = getCharacter(); if not char then return end
+		local se = char:FindFirstChild("StandEvents") or char:WaitForChild("StandEvents",1)
+		if not se then return end
+		local ev = se:FindFirstChild("M1"); if not ev then return end
+		pcall(function() ev:FireServer() end)
+	end},
+	{ id = "Barrage", label = "Barrage", selected = false, fire = function()
+		local char = getCharacter(); if not char then return end
+		local se = char:FindFirstChild("StandEvents") or char:WaitForChild("StandEvents",1)
+		if not se then return end
+		local ev = se:FindFirstChild("Barrage"); if not ev then return end
+		pcall(function() ev:FireServer(true) end)
+	end},
+	{ id = "Heavy",   label = "Heavy",   selected = false, fire = function()
+		local char = getCharacter(); if not char then return end
+		local se = char:FindFirstChild("StandEvents") or char:WaitForChild("StandEvents",1)
+		if not se then return end
+		local ev = se:FindFirstChild("Heavy"); if not ev then return end
+		pcall(function() ev:FireServer() end)
+	end},
+	{ id = "Slash",   label = "Slash",   selected = false, fire = function()
+		local char = getCharacter(); if not char then return end
+		local se = char:FindFirstChild("StandEvents") or char:WaitForChild("StandEvents",1)
+		if not se then return end
+		local ev = se:FindFirstChild("Slash"); if not ev then return end
+		pcall(function() ev:FireServer() end)
+	end},
+	{ id = "Soul",    label = "Soul",    selected = false, fire = function()
+		local char = getCharacter(); if not char then return end
+		local se = char:FindFirstChild("StandEvents") or char:WaitForChild("StandEvents",1)
+		if not se then return end
+		local ev = se:FindFirstChild("Soul"); if not ev then return end
+		pcall(function() ev:FireServer() end)
+	end},
+	{ id = "Par",     label = "Par",     selected = false, fire = function()
+		local char = getCharacter(); if not char then return end
+		local se = char:FindFirstChild("StandEvents") or char:WaitForChild("StandEvents",1)
+		if not se then return end
+		local ev = se:FindFirstChild("Par"); if not ev then return end
+		pcall(function() ev:FireServer() end)
+	end},
+}
+
+-- Fires all currently selected remotes
+local function fireSelectedRemotes()
+	for _, remote in ipairs(SPAM_REMOTES) do
+		if remote.selected then
+			remote.fire()
+		end
+	end
+end
+
+task.spawn(function()
+	while true do
+		if spamActive then
+			fireSelectedRemotes()
+			task.wait(FIRE_RATE)
+		else
+			task.wait(0.05)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- GO-BEHIND LOOP
+-- ──────────────────────────────────────────────
+task.spawn(function()
+	while true do
+		if goActive then
+			moveBehindBoss()
+			task.wait(useTween and TWEEN_TIME or 0.05)
+		else
+			task.wait(0.05)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- AUTO FIRE LOOP
+-- ──────────────────────────────────────────────
+local lastAutoFire = 0
+
+task.spawn(function()
+	while true do
+		if autoFireActive then
+			local now = tick()
+			if now - lastAutoFire >= 1 then
+				lastAutoFire = now
+				pcall(function()
+					local npcs = game.workspace:FindFirstChild("Map")
+						and game.workspace.Map:FindFirstChild("NPCs")
+					if not npcs then return end
+					local target = npcs:GetChildren()[40]
+					if not target then return end
+					local done = target:FindFirstChild("Done")
+					if done and done:IsA("RemoteEvent") then
+						done:FireServer()
+					end
+				end)
+			end
+			task.wait(0.05)
+		else
+			task.wait(0.05)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- AUTO FIRE NPC (JOTARO'S LAIR) LOOP
+-- ──────────────────────────────────────────────
+local lastAutoFireNPC = 0
+
+task.spawn(function()
+	while true do
+		if autoFireNPCActive then
+			local now = tick()
+			if now - lastAutoFireNPC >= 1 then
+				lastAutoFireNPC = now
+				pcall(function()
+					local Event = workspace.Map.NPCs:GetChildren()[41].Done
+					Event:FireServer()
+				end)
+			end
+			task.wait(0.05)
+		else
+			task.wait(0.05)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- AUTO FIRE NPC (DIAVOLO'S LAIR) LOOP
+-- ──────────────────────────────────────────────
+local lastAutoDiavolo = 0
+
+task.spawn(function()
+	while true do
+		if autoDiavoloActive then
+			local now = tick()
+			if now - lastAutoDiavolo >= 1 then
+				lastAutoDiavolo = now
+				pcall(function()
+					local Event = workspace.Map.NPCs.i_stabman.Done
+					Event:FireServer()
+				end)
+			end
+			task.wait(0.05)
+		else
+			task.wait(0.05)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- ──────────────────────────────────────────────
+local summonDeathConn  = nil
+local summonFireCount  = 0
+local summonCountLabel = nil
+
+local function getArrowPart()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+	local standModel = workspace:FindFirstChild("Living")
+		and workspace.Living:FindFirstChild(LocalPlayer.Name)
+		and workspace.Living[LocalPlayer.Name]:FindFirstChild("Stand")
+		and workspace.Living[LocalPlayer.Name].Stand:FindFirstChild("Model")
+	if not standModel then return nil end
+	for _, v in pairs(standModel:GetChildren()) do
+		if v.Name:sub(1, 5) == "Arrow" then
+			return v
+		end
+	end
+	return nil
+end
+
+local function isStandSummoned()
+	local playerFolder = workspace:FindFirstChild("Living")
+		and workspace.Living:FindFirstChild(LocalPlayer.Name)
+	local lowerTorso = playerFolder
+		and playerFolder:FindFirstChild("Stand")
+		and playerFolder.Stand:FindFirstChild("LowerTorso")
+	if not lowerTorso then return false end -- part missing = stand not summoned, keep trying
+	return lowerTorso.Transparency == 0 -- transparency 0 = visible = summoned
+end
+
+local function fireSummon()
+	local char = LocalPlayer.Character
+	if not char then return end
+	local standEvents = char:FindFirstChild("StandEvents")
+		or char:WaitForChild("StandEvents", 5)
+	if not standEvents then return end
+	local summonEvent = standEvents:FindFirstChild("Summon")
+		or standEvents:WaitForChild("Summon", 5)
+	if summonEvent then
+		pcall(function() summonEvent:FireServer() end)
+		summonFireCount += 1
+		if summonCountLabel then
+			summonCountLabel.Text = "Fires: " .. summonFireCount
+		end
+	end
+end
+
+-- Keep-alive loop: if toggle is on and stand is not summoned, re-summon it
+task.spawn(function()
+	while true do
+		if autoSummonActive then
+			if not isStandSummoned() then
+				fireSummon()
+				task.wait(1.5) -- short cooldown after firing to avoid double-fire
+			else
+				task.wait(0.3)
+			end
+		else
+			task.wait(0.3)
+		end
+	end
+end)
+
+local function connectSummonDeath(character)
+	if summonDeathConn then summonDeathConn:Disconnect() end
+	local hum = character:WaitForChild("Humanoid", 10)
+	if not hum then return end
+	summonDeathConn = hum.Died:Connect(function()
+		if not autoSummonActive then return end
+		LocalPlayer.CharacterAdded:Wait()
+		task.wait(1.5)
+	end)
+end
+
+LocalPlayer.CharacterAdded:Connect(function(char) connectSummonDeath(char) end)
+if LocalPlayer.Character then connectSummonDeath(LocalPlayer.Character) end
+
+-- ──────────────────────────────────────────────
+-- DIO QUEST LOOP
+-- ──────────────────────────────────────────────
+local function getJotaro()
+	local living = workspace:FindFirstChild("Living")
+	if not living then return nil end
+	return living:FindFirstChild("Jotaro Part 4")
+end
+
+local function isJotaroAlive()
+	local j = getJotaro()
+	if not j then return false end
+	local hum = j:FindFirstChildWhichIsA("Humanoid", true)
+	return hum and hum.Health > 0
+end
+
+local function getM1Remote()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+	local se = char:FindFirstChild("StandEvents") or char:WaitForChild("StandEvents", 1)
+	if not se then return nil end
+	return se:FindFirstChild("M1")
+end
+
+task.spawn(function()
+	while true do
+		if not questActive then
+			task.wait(0.2)
+		else
+			-- STEP 1: Fire the quest start remote
+			if questStatusLabel then questStatusLabel.Text = "Firing quest start..." end
+			pcall(function()
+				workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("DIO"):WaitForChild("Done"):FireServer()
+			end)
+			task.wait(0.5)
+
+			-- STEP 2: Wait for Jotaro to be alive
+			if questStatusLabel then questStatusLabel.Text = "Waiting for Jotaro..." end
+			local waitedFor = 0
+			while questActive and not isJotaroAlive() do
+				task.wait(0.5)
+				waitedFor += 0.5
+				if waitedFor > 30 then break end
+			end
+
+			if not questActive then task.wait(0.1) continue end
+
+			local jotaro = getJotaro()
+			if not jotaro then
+				if questStatusLabel then questStatusLabel.Text = "Jotaro not found, retrying..." end
+				task.wait(2)
+				continue
+			end
+
+			-- STEP 3: Teleport behind Jotaro
+			if questStatusLabel then questStatusLabel.Text = "Teleporting to Jotaro..." end
+			pcall(function()
+				local hrp = getRootPart()
+				local lowerTorso = workspace.Living["Jotaro Part 4"]:FindFirstChild("LowerTorso")
+				if hrp and lowerTorso then
+					hrp.CFrame = lowerTorso.CFrame * CFrame.new(0, 0, 3)
+				end
+			end)
+			task.wait(0.3)
+
+			-- STEP 4: Spam M1 until Jotaro dies
+			if questStatusLabel then questStatusLabel.Text = "Spamming M1 on Jotaro..." end
+			while questActive and isJotaroAlive() do
+				pcall(function()
+					local hrp = getRootPart()
+					local lowerTorso = workspace.Living["Jotaro Part 4"] and workspace.Living["Jotaro Part 4"]:FindFirstChild("LowerTorso")
+					if hrp and lowerTorso then
+						hrp.CFrame = lowerTorso.CFrame * CFrame.new(0, 0, 3)
+					end
+				end)
+				pcall(function()
+					local m1 = getM1Remote()
+					if m1 then m1:FireServer() end
+				end)
+				task.wait(FIRE_RATE)
+			end
+
+			if not questActive then task.wait(0.1) continue end
+
+			-- STEP 5: Fire QuestDone
+			if questStatusLabel then questStatusLabel.Text = "Jotaro dead! Firing QuestDone..." end
+			task.wait(0.3)
+			pcall(function()
+				workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("DIO"):WaitForChild("QuestDone"):FireServer()
+			end)
+			task.wait(1)
+
+			if questStatusLabel then questStatusLabel.Text = "Loop complete, restarting..." end
+			task.wait(0.5)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- BOSS KILL TIMER LOOP
+-- ──────────────────────────────────────────────
+task.spawn(function()
+	while true do
+		if killTimerActive then
+			local model = getModel()
+			local hum   = getModelHumanoid(model)
+			if hum and hum.Health > 0 then
+				if killTimerStart == nil then killTimerStart = tick() end
+				local elapsed   = tick() - killTimerStart
+				local remaining = math.max(0, killTimerDuration - math.floor(elapsed))
+				if killTimerLabel then
+					killTimerLabel.Text       = ("Kill timer: %ds left"):format(remaining)
+					killTimerLabel.TextColor3 = remaining <= 10
+						and Color3.fromRGB(255, 75, 75)
+						or  Color3.fromRGB(255, 165, 50)
+				end
+				if elapsed >= killTimerDuration then
+					killTimerStart = nil
+					if killTimerLabel then
+						killTimerLabel.Text       = "Timeout! Resetting..."
+						killTimerLabel.TextColor3 = Color3.fromRGB(255, 75, 75)
+					end
+					pcall(function()
+						local char = getCharacter()
+						if char then
+							local h = char:FindFirstChildWhichIsA("Humanoid")
+							if h then h.Health = 0 end
+						end
+					end)
+					task.wait(3)
+				end
+			else
+				killTimerStart = nil
+				if killTimerLabel then
+					killTimerLabel.Text       = "Kill timer: waiting for boss"
+					killTimerLabel.TextColor3 = Color3.fromRGB(100, 90, 145)
+				end
+			end
+			task.wait(0.5)
+		else
+			killTimerStart = nil
+			if killTimerLabel then
+				killTimerLabel.Text       = "Kill timer: OFF"
+				killTimerLabel.TextColor3 = Color3.fromRGB(65, 58, 100)
+			end
+			task.wait(0.5)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- AUTO QUEST DATA & LOGIC
+-- ──────────────────────────────────────────────
+local AQ_QUESTS = {
+	{ name = "Lvl 1  — Bad Gi",          level = 1,   enemyName = "Bad Gi",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Giorno"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Giorno"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 10 — Scary Monster",   level = 10,  enemyName = "Scary Monster",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Scared Noob"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Scared Noob"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 20 — Giorno Giovanna", level = 20,  enemyName = "Giorno Giovanna",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Koichi"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Koichi"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 30 — Rker Dummy",      level = 30,  enemyName = "Rker Dummy",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("aLLmemester"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("aLLmemester"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 40 — Yoshikage Kira",  level = 40,  enemyName = "Yoshikage Kira",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Okayasu"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Okayasu"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 50 — Dio Over Heaven", level = 50,  enemyName = "Dio Over Heaven",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Joseph Joestar"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Joseph Joestar"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 75 — Angelo",          level = 75,  enemyName = "Angelo",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Josuke"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Josuke"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 100 — Alien",          level = 100, enemyName = "Alien",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Rohan"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Rohan"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 125 — Jotaro Pt4",     level = 125, enemyName = "Jotaro Part 4",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("DIO"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("DIO"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 150 — Kakyoin",        level = 150, enemyName = "Kakyoin",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Muhammed Avdol"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Muhammed Avdol"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 175 — Jungle Bandit",  level = 175, enemyName = "Jungle Bandit",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Giorno"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Giorno"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 200 — Sewer Vampire",  level = 200, enemyName = "Sewer Vampire",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Zeppeli"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Zeppeli"):WaitForChild("QuestDone"):FireServer() end) end },
+	{ name = "Lvl 275 — Pillerman",      level = 275, enemyName = "Pillerman",
+	  take = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Young Joseph"):WaitForChild("Done"):FireServer() end) end,
+	  done = function() pcall(function() workspace:WaitForChild("Map"):WaitForChild("NPCs"):WaitForChild("Young Joseph"):WaitForChild("QuestDone"):FireServer() end) end },
+}
+
+local function aqGetPlayerLevel()
+	local ok, val = pcall(function() return LocalPlayer.Data.Value end)
+	if ok and type(val) == "number" then return val end
+	for _, obj in ipairs(LocalPlayer:GetDescendants()) do
+		if obj.Name == "Level" and (obj:IsA("IntValue") or obj:IsA("NumberValue")) then
+			return obj.Value
+		end
+	end
+	return 0
+end
+
+local function aqGetSmartQuest()
+	local level = aqGetPlayerLevel()
+	local best = nil
+	for _, q in ipairs(AQ_QUESTS) do
+		if q.level <= level then best = q end
+	end
+	return best
+end
+
+local function aqGetEnemies(enemyName)
+	local list = {}
+	local living = workspace:FindFirstChild("Living")
+	if not living then return list end
+	for _, obj in ipairs(living:GetChildren()) do
+		if obj.Name == enemyName then
+			local hum = obj:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health > 0 then table.insert(list, obj) end
+		end
+	end
+	return list
+end
+
+local function aqIsAlive(enemy)
+	local hum = enemy:FindFirstChildOfClass("Humanoid")
+	return hum and hum.Health > 0
+end
+
+local function aqTeleportBehind(enemy)
+	local enemyHRP = enemy:FindFirstChild("HumanoidRootPart")
+	if not enemyHRP then return end
+	local hrp = getRootPart()
+	if not hrp then return end
+	hrp.CFrame = enemyHRP.CFrame * CFrame.new(aqTeleOffset)
+end
+
+local function aqDoAttacks()
+	local char = getCharacter()
+	if not char then return end
+	local se = char:FindFirstChild("StandEvents")
+	if not se then return end
+	if aqAttacks.M1 then
+		local r = se:FindFirstChild("M1")
+		if r then pcall(function() r:FireServer() end) end
+		task.wait(aqAttackDelay)
+	end
+	if aqAttacks.Barrage then
+		local r = se:FindFirstChild("Barrage")
+		if r then pcall(function() r:FireServer(true) end) end
+		task.wait(aqAttackDelay)
+	end
+	if aqAttacks.Heavy then
+		local r = se:FindFirstChild("Heavy")
+		if r then pcall(function() r:FireServer() end) end
+		task.wait(aqAttackDelay)
+	end
+end
+
+local function aqKillEnemy(enemy)
+	while aqRunning and aqIsAlive(enemy) do
+		aqTeleportBehind(enemy)
+		aqDoAttacks()
+		task.wait(0.05)
+	end
+end
+
+local function aqRemoteLoop()
+	while aqRunning do
+		if aqActiveQuest.value then
+			aqActiveQuest.value.take()
+			aqActiveQuest.value.done()
+		end
+		task.wait(0.5)
+	end
+end
+
+local function aqRunQuest(startQuest)
+	aqActiveQuest.value = startQuest
+	task.spawn(aqRemoteLoop)
+	while aqRunning do
+		if aqSmartMode then
+			local smart = aqGetSmartQuest()
+			if smart and smart.name ~= aqActiveQuest.value.name then
+				aqActiveQuest.value = smart
+				pcall(function() aqDropBtn.Text = "▼  " .. smart.name end)
+				pcall(function() aqStatusLabel.Text = "Smart — " .. smart.name end)
+			end
+		end
+		local timeout = tick() + 120
+		repeat
+			local enemies = aqGetEnemies(aqActiveQuest.value.enemyName)
+			if #enemies > 0 then
+				aqKillEnemy(enemies[1])
+				task.wait(0.2)
+			else
+				task.wait(0.3)
+			end
+		until not aqRunning or tick() > timeout
+		task.wait(0.2)
+	end
+end
+
+-- ──────────────────────────────────────────────
+-- INVENTORY WEBHOOK
+-- ──────────────────────────────────────────────
+local function getItemAmount(itemName)
+	local item = LocalPlayer.Backpack:FindFirstChild(itemName)
+	if item then return item:GetAttribute("ItemAmount") or 0 end
+	return 0
+end
+
+local function sendWebhook()
+	if webhookURL == "" or webhookURL == "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE" then
+		return false, "No webhook URL set"
+	end
+	local rokakaka     = getItemAmount("Rokakaka")
+	local standArrow   = getItemAmount("Stand Arrow")
+	local chargedArrow = getItemAmount("Charged Arrow")
+	local ok, data = pcall(function()
+		return HttpService:JSONEncode({
+			username = "Inventory Tracker",
+			embeds = {{
+				title  = "📦 " .. LocalPlayer.Name .. "'s Inventory",
+				color  = 0x9B59B6,
+				fields = {
+					{ name = "Rokakaka",      value = tostring(rokakaka),     inline = true },
+					{ name = "Stand Arrow",   value = tostring(standArrow),   inline = true },
+					{ name = "Charged Arrow", value = tostring(chargedArrow), inline = true }
+				},
+				footer    = { text = "Auto-tracker • interval: " .. webhookInterval .. "s" },
+				timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+			}}
+		})
+	end)
+	if not ok then return false, "JSON encode failed" end
+	local sendOk, response = pcall(function()
+		return (http and http.request or request)({
+			Url = webhookURL, Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" }, Body = data
+		})
+	end)
+	if sendOk and response and response.StatusCode == 204 then
+		webhookSendCount += 1
+		if webhookCountLabel then webhookCountLabel.Text = "Sent: " .. webhookSendCount end
+		return true, "OK"
+	end
+	local code = (sendOk and response) and tostring(response.StatusCode) or "err"
+	return false, "Status: " .. code
+end
+
+task.spawn(function()
+	while true do
+		if webhookActive then
+			local now = tick()
+			if now - lastWebhookSend >= webhookInterval then
+				lastWebhookSend = now
+				sendWebhook()
+			end
+			task.wait(1)
+		else
+			task.wait(0.5)
+		end
+	end
+end)
+
+-- ──────────────────────────────────────────────
+-- STAND AUTO-ROLL LOGIC
+-- ──────────────────────────────────────────────
+local function sendStandAlert(foundAttribute)
+	if standWebhookURL == "" or standWebhookURL == "https://discord.com/api/webhooks/YOUR_STAND_WEBHOOK_HERE" then return end
+
+	-- Grab the stand name from the GUI label (e.g. "Stand: Silver Chariot Requiem")
+	local standNameText = "Unknown"
+	pcall(function()
+		local lbl = getStandNameLabel()
+		if lbl then
+			local raw = lbl.ContentText or lbl.Text or ""
+			-- Strip leading "Stand: " prefix if present
+			standNameText = raw:match("^Stand:%s*(.+)$") or raw
+		end
+	end)
+
+	-- Build optional @mention string
+	local mentionContent = ""
+	if standMentionID ~= "" then
+		mentionContent = "<@" .. standMentionID .. ">"
+	end
+
+	local ok, data = pcall(function()
+		return HttpService:JSONEncode({
+			content  = mentionContent,
+			username = "Attribute Sniper",
+			embeds = {{
+				title       = "🎯 Target Attribute Found!",
+				description = "Successfully rolled a high-tier attribute on **" .. LocalPlayer.Name .. "**",
+				color       = 0x00FF00,
+				fields      = {
+					{ name = "Stand",     value = standNameText,  inline = true },
+					{ name = "Attribute", value = foundAttribute, inline = true }
+				},
+				timestamp   = os.date("!%Y-%m-%dT%H:%M:%SZ")
+			}}
+		})
+	end)
+	if not ok then return end
+	pcall(function()
+		local requestFunc = (http and http.request or request)
+		if requestFunc then
+			requestFunc({
+				Url = standWebhookURL, Method = "POST",
+				Headers = { ["Content-Type"] = "application/json" }, Body = data
+			})
+		end
+	end)
+end
+
+local function checkStopList()
+	local lbl = getAttrLabel()
+	if not lbl then return false end
+	local currentText = lbl.ContentText or lbl.Text or ""
+	for _, word in pairs(standStopList) do
+		if string.find(currentText, word) then
+			return true, currentText
+		end
+	end
+	return false, currentText
+end
+
+local function standEquipAndUse(itemName)
+	local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	local hum  = char:WaitForChild("Humanoid", 5)
+	if not hum then return false end
+	local item = LocalPlayer.Backpack:FindFirstChild(itemName) or char:FindFirstChild(itemName)
+	if not item then return false end
+	hum:EquipTool(item)
+	task.wait(0.5)
+	local ev = getUseEvent()
+	if ev then pcall(function() ev:FireServer() end) end
+	return true
+end
+
+-- The roll loop runs as a task.spawn and is gated by standRollActive
+task.spawn(function()
+	while true do
+		if not standRollActive then
+			task.wait(0.2)
+		else
+			-- 1. Check current attribute
+			local stop, attr = checkStopList()
+			if stop then
+				standRollActive = false
+				sendStandAlert(attr)
+				-- Update GUI labels (set from GUI section below)
+				if standStatusLabel then
+					standStatusLabel.Text      = "✓ Stopped: " .. attr
+					standStatusLabel.TextColor3= Color3.fromRGB(100, 230, 140)
+				end
+				if standRollLabel then standRollLabel.Text = "OFF" end
+				-- The toggle visual is updated via the shared setStandVis reference below
+				if _setStandVis then _setStandVis(false) end
+			else
+				standRollCount += 1
+				if standStatusLabel then
+					standStatusLabel.Text      = "Rolling... #" .. standRollCount
+					standStatusLabel.TextColor3= Color3.fromRGB(200, 170, 255)
+				end
+
+				-- 2. Rokakaka
+				if not standEquipAndUse("Rokakaka") then
+					standRollActive = false
+					if standStatusLabel then
+						standStatusLabel.Text      = "✗ Out of Rokakakas"
+						standStatusLabel.TextColor3= Color3.fromRGB(255, 80, 80)
+					end
+					if standRollLabel then standRollLabel.Text = "OFF" end
+					if _setStandVis then _setStandVis(false) end
+				else
+					task.wait(3)
+
+					-- 3. Charged Arrow
+					if not standEquipAndUse("Charged Arrow") then
+						standRollActive = false
+						if standStatusLabel then
+							standStatusLabel.Text      = "✗ Out of Charged Arrows"
+							standStatusLabel.TextColor3= Color3.fromRGB(255, 80, 80)
+						end
+						if standRollLabel then standRollLabel.Text = "OFF" end
+						if _setStandVis then _setStandVis(false) end
+					else
+						task.wait(2.5)
+
+						-- 4. Final check
+						local stopFinal, attrFinal = checkStopList()
+						if stopFinal then
+							standRollActive = false
+							sendStandAlert(attrFinal)
+							if standStatusLabel then
+								standStatusLabel.Text      = "✓ Stopped: " .. attrFinal
+								standStatusLabel.TextColor3= Color3.fromRGB(100, 230, 140)
+							end
+							if standRollLabel then standRollLabel.Text = "OFF" end
+							if _setStandVis then _setStandVis(false) end
+						else
+							task.wait(standLoopCooldown)
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+
+-- ══════════════════════════════════════════════════════════════
+--   GUI  ·  NEON REBIRTH  —  per-tab colour themes
+-- ══════════════════════════════════════════════════════════════
+
+-- ────────────────────────────────────────────────────────────
+--  NEUTRAL PALETTE  (shared across all tabs)
+-- ────────────────────────────────────────────────────────────
+local BG      = Color3.fromRGB(7,   6,  14)   -- near-black base
+local SURFACE = Color3.fromRGB(13,  11,  24)   -- panel bg
+local CARD    = Color3.fromRGB(19,  16,  34)   -- row cards
+local INPUTBG = Color3.fromRGB(10,   9,  20)   -- text-box bg
+local WHITE   = Color3.new(1, 1, 1)
+local TOGOFF  = Color3.fromRGB(30,  26,  48)   -- toggle OFF track
+local DIM     = Color3.fromRGB(65,  58, 100)   -- muted border / icon
+local MUTED   = Color3.fromRGB(100, 90, 145)   -- secondary text
+
+-- ────────────────────────────────────────────────────────────
+--  PER-TAB THEME TABLES
+--    .pri   = main accent / toggle-on colour
+--    .glow  = brighter variant for top-bar / hover
+--    .text  = bright label text
+--    .sub   = softer label text
+--    .good  = "success" green-ish
+--    .bad   = "error" red-ish
+-- ────────────────────────────────────────────────────────────
+local THEME = {
+    spam = {   -- ⚔  Crimson / Ember
+        pri  = Color3.fromRGB(230,  55,  75),
+        glow = Color3.fromRGB(255, 110,  90),
+        text = Color3.fromRGB(255, 200, 195),
+        sub  = Color3.fromRGB(190, 130, 125),
+        good = Color3.fromRGB( 80, 255, 155),
+        bad  = Color3.fromRGB(255,  75,  75),
+    },
+    webhook = {  -- 🔔  Sapphire / Cyan
+        pri  = Color3.fromRGB( 35, 170, 255),
+        glow = Color3.fromRGB( 95, 215, 255),
+        text = Color3.fromRGB(185, 235, 255),
+        sub  = Color3.fromRGB(115, 175, 215),
+        good = Color3.fromRGB( 75, 255, 200),
+        bad  = Color3.fromRGB(255,  85,  85),
+    },
+    stand = {    -- ★  Golden Yellow
+        pri  = Color3.fromRGB(255, 200,   0),
+        glow = Color3.fromRGB(255, 230,  80),
+        text = Color3.fromRGB(255, 245, 180),
+        sub  = Color3.fromRGB(220, 185, 100),
+        good = Color3.fromRGB( 80, 255, 155),
+        bad  = Color3.fromRGB(255,  80,  80),
+    },
+    quest = {    -- 📜  Neon Green
+        pri  = Color3.fromRGB( 50, 220,  90),
+        glow = Color3.fromRGB(100, 255, 140),
+        text = Color3.fromRGB(190, 255, 210),
+        sub  = Color3.fromRGB(130, 200, 155),
+        good = Color3.fromRGB( 80, 255, 155),
+        bad  = Color3.fromRGB(255,  80,  80),
+    },
+    autoquest = {  -- ⚡  Crimson / Ember (same red family as spam tab)
+        pri  = Color3.fromRGB(230,  55,  75),
+        glow = Color3.fromRGB(255, 110,  90),
+        text = Color3.fromRGB(255, 200, 195),
+        sub  = Color3.fromRGB(190, 130, 125),
+        good = Color3.fromRGB( 80, 255, 155),
+        bad  = Color3.fromRGB(255,  75,  75),
+    },
+}
+
+-- ────────────────────────────────────────────────────────────
+--  MICRO HELPERS
+-- ────────────────────────────────────────────────────────────
+local function corner(r, p)
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r); c.Parent = p
+end
+local function newStroke(col, thick, p)
+    local s = Instance.new("UIStroke"); s.Color = col; s.Thickness = thick; s.Parent = p; return s
+end
+local function pad(t, b, l, r, p)
+    local u = Instance.new("UIPadding")
+    u.PaddingTop    = UDim.new(0, t); u.PaddingBottom = UDim.new(0, b)
+    u.PaddingLeft   = UDim.new(0, l); u.PaddingRight  = UDim.new(0, r)
+    u.Parent = p
+end
+local function vlist(gap, p)
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, gap); l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.HorizontalAlignment = Enum.HorizontalAlignment.Center; l.Parent = p; return l
+end
+local function tw(obj, t, props)
+    TweenService:Create(obj, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+-- ────────────────────────────────────────────────────────────
+--  SCREEN GUI
+-- ────────────────────────────────────────────────────────────
+local PW     = 318   -- panel width
+local PH     = 430   -- panel height (auto-sizes via scroll)
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name           = "BossSpammerGui"
+screenGui.ResetOnSpawn   = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.DisplayOrder   = 999
+screenGui.Parent         = LocalPlayer.PlayerGui
+
+-- Outer ambient glow (colour morphs per tab)
+local glowFrame = Instance.new("Frame")
+glowFrame.Size                  = UDim2.new(0, PW + 20, 0, PH + 20)
+glowFrame.Position              = UDim2.new(0, 10, 0, 10)
+glowFrame.BackgroundColor3      = THEME.spam.pri
+glowFrame.BackgroundTransparency= 0.78
+glowFrame.BorderSizePixel       = 0
+glowFrame.Parent                = screenGui
+corner(20, glowFrame)
+
+-- Main frame
+local frame = Instance.new("Frame")
+frame.Name            = "MainFrame"
+frame.Size            = UDim2.new(0, PW, 0, PH)
+frame.Position        = UDim2.new(0, 20, 0, 20)
+frame.BackgroundColor3= BG
+frame.BorderSizePixel = 0
+frame.Active          = true
+frame.Parent          = screenGui
+corner(16, frame)
+local frameBorder = newStroke(THEME.spam.pri, 1.5, frame)
+
+-- Thin coloured top cap
+local topCap = Instance.new("Frame")
+topCap.Size             = UDim2.new(1, 0, 0, 3)
+topCap.BackgroundColor3 = THEME.spam.glow
+topCap.BackgroundTransparency = 0.15
+topCap.BorderSizePixel  = 0
+topCap.ZIndex           = 6
+topCap.Parent           = frame
+corner(16, topCap)
+
+-- ────────────────────────────────────────────────────────────
+--  TITLE BAR
+-- ────────────────────────────────────────────────────────────
+local titleBar = Instance.new("Frame")
+titleBar.Name             = "TitleBar"
+titleBar.Size             = UDim2.new(1, 0, 0, 50)
+titleBar.BackgroundColor3 = SURFACE
+titleBar.BorderSizePixel  = 0
+titleBar.Parent           = frame
+corner(16, titleBar)
+local tbFill = Instance.new("Frame")   -- flatten bottom rounded corners
+tbFill.Size             = UDim2.new(1, 0, 0, 16)
+tbFill.Position         = UDim2.new(0, 0, 1, -16)
+tbFill.BackgroundColor3 = SURFACE
+tbFill.BorderSizePixel  = 0
+tbFill.Parent           = titleBar
+
+-- Icon badge
+local iconBadge = Instance.new("Frame")
+iconBadge.Size            = UDim2.new(0, 34, 0, 34)
+iconBadge.Position        = UDim2.new(0, 11, 0.5, -17)
+iconBadge.BackgroundColor3= THEME.spam.pri
+iconBadge.BorderSizePixel = 0
+iconBadge.Parent          = titleBar
+corner(10, iconBadge)
+-- inner shadow overlay
+local iconShade = Instance.new("Frame")
+iconShade.Size                  = UDim2.new(1, 0, 1, 0)
+iconShade.BackgroundColor3      = Color3.new(0, 0, 0)
+iconShade.BackgroundTransparency= 0.45
+iconShade.BorderSizePixel       = 0
+iconShade.Parent                = iconBadge
+corner(10, iconShade)
+local iconLbl = Instance.new("TextLabel")
+iconLbl.Text                = "⚔"
+iconLbl.Font                = Enum.Font.GothamBold
+iconLbl.TextSize            = 17
+iconLbl.TextColor3          = WHITE
+iconLbl.BackgroundTransparency = 1
+iconLbl.Size                = UDim2.new(1, 0, 1, 0)
+iconLbl.Parent              = iconBadge
+
+local titleLbl = Instance.new("TextLabel")
+titleLbl.Text               = "BOSS SPAMMER"
+titleLbl.Font               = Enum.Font.GothamBold
+titleLbl.TextSize           = 14
+titleLbl.TextColor3         = THEME.spam.text
+titleLbl.BackgroundTransparency = 1
+titleLbl.Size               = UDim2.new(0, 155, 0, 20)
+titleLbl.Position           = UDim2.new(0, 54, 0, 8)
+titleLbl.TextXAlignment     = Enum.TextXAlignment.Left
+titleLbl.Parent             = titleBar
+
+local subLbl = Instance.new("TextLabel")
+subLbl.Text                 = "All-in-One  ·  Anti-AFK active"
+subLbl.Font                 = Enum.Font.Gotham
+subLbl.TextSize             = 9
+subLbl.TextColor3           = DIM
+subLbl.BackgroundTransparency = 1
+subLbl.Size                 = UDim2.new(0, 200, 0, 13)
+subLbl.Position             = UDim2.new(0, 54, 0, 29)
+subLbl.TextXAlignment       = Enum.TextXAlignment.Left
+subLbl.Parent               = titleBar
+
+-- Window control buttons
+local function winBtn(sym, col, ox)
+    local b = Instance.new("TextButton")
+    b.Text            = sym
+    b.Font            = Enum.Font.GothamBold
+    b.TextSize        = 11
+    b.TextColor3      = col
+    b.BackgroundColor3= Color3.fromRGB(22, 18, 38)
+    b.BorderSizePixel = 0
+    b.Size            = UDim2.new(0, 24, 0, 20)
+    b.Position        = UDim2.new(1, ox, 0.5, -10)
+    b.Parent          = titleBar
+    corner(6, b); newStroke(col, 0.8, b)
+    b.MouseEnter:Connect(function() tw(b, 0.12, {BackgroundColor3 = col}) end)
+    b.MouseLeave:Connect(function() tw(b, 0.12, {BackgroundColor3 = Color3.fromRGB(22, 18, 38)}) end)
+    return b
+end
+local minBtn   = winBtn("—", MUTED,                           -58)
+local closeBtn = winBtn("✕", Color3.fromRGB(255, 65, 85),     -28)
+
+-- ────────────────────────────────────────────────────────────
+--  TAB BAR  (individual pill per tab with its own colour)
+-- ────────────────────────────────────────────────────────────
+local tabBg = Instance.new("Frame")
+tabBg.Size             = UDim2.new(1, -16, 0, 36)
+tabBg.Position         = UDim2.new(0, 8, 0, 56)
+tabBg.BackgroundColor3 = CARD
+tabBg.BorderSizePixel  = 0
+tabBg.Parent           = frame
+corner(12, tabBg)
+newStroke(DIM, 0.8, tabBg)
+pad(4, 4, 4, 4, tabBg)
+
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection       = Enum.FillDirection.Horizontal
+tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+tabLayout.VerticalAlignment   = Enum.VerticalAlignment.Center
+tabLayout.Padding             = UDim.new(0, 3)
+tabLayout.SortOrder           = Enum.SortOrder.LayoutOrder
+tabLayout.Parent              = tabBg
+
+-- tab pill factory
+local tabPills = {}
+local function makeTabPill(name, icon, order)
+    local col = THEME[name].pri
+    local btn = Instance.new("TextButton")
+    btn.Text                = icon
+    btn.Font                = Enum.Font.GothamBold
+    btn.TextSize            = 11
+    btn.TextColor3          = DIM
+    btn.BackgroundColor3    = Color3.new(0,0,0)
+    btn.BackgroundTransparency = 1
+    btn.BorderSizePixel     = 0
+    btn.Size                = UDim2.new(0.20, 0, 1, 0)
+    btn.LayoutOrder         = order
+    btn.Parent              = tabBg
+
+    -- active highlight pill
+    local pill = Instance.new("Frame")
+    pill.Size                  = UDim2.new(0.88, 0, 0.72, 0)
+    pill.Position              = UDim2.new(0.06, 0, 0.14, 0)
+    pill.BackgroundColor3      = col
+    pill.BackgroundTransparency= 1
+    pill.BorderSizePixel       = 0
+    pill.Parent                = btn
+    corner(7, pill)
+
+    -- bottom underline
+    local line = Instance.new("Frame")
+    line.Size                  = UDim2.new(0.55, 0, 0, 2)
+    line.Position              = UDim2.new(0.225, 0, 1, -2)
+    line.BackgroundColor3      = col
+    line.BackgroundTransparency= 1
+    line.BorderSizePixel       = 0
+    line.Parent                = btn
+    corner(1, line)
+
+    tabPills[name] = {btn=btn, pill=pill, line=line, col=col}
+    return btn
+end
+
+local spamTabBtn    = makeTabPill("spam",      "⚔  Spammer",    1)
+local webhookTabBtn = makeTabPill("webhook",   "🔔  Webhook",    2)
+local standTabBtn   = makeTabPill("stand",     "★  Stand Roll",  3)
+local questTabBtn   = makeTabPill("quest",     "📜  Quests",     4)
+local aqTabBtn      = makeTabPill("autoquest", "⚡  Auto Quest", 5)
+
+-- ────────────────────────────────────────────────────────────
+--  SCROLLABLE BODY
+-- ────────────────────────────────────────────────────────────
+local bodyArea = Instance.new("ScrollingFrame")
+bodyArea.Name                   = "BodyArea"
+bodyArea.Size                   = UDim2.new(1, -6, 1, -102)
+bodyArea.Position               = UDim2.new(0, 3, 0, 98)
+bodyArea.BackgroundTransparency = 1
+bodyArea.BorderSizePixel        = 0
+bodyArea.ScrollBarThickness     = 3
+bodyArea.ScrollBarImageColor3   = MUTED
+bodyArea.CanvasSize             = UDim2.new(0, 0, 0, 0)
+bodyArea.AutomaticCanvasSize    = Enum.AutomaticSize.Y
+bodyArea.Parent                 = frame
+
+-- ────────────────────────────────────────────────────────────
+--  SHARED WIDGET CONSTRUCTORS
+-- ────────────────────────────────────────────────────────────
+
+local function makeContentFrame(parent)
+    local f = Instance.new("Frame")
+    f.Size             = UDim2.new(1, 0, 0, 0)
+    f.AutomaticSize    = Enum.AutomaticSize.Y
+    f.BackgroundTransparency = 1
+    f.Visible          = false
+    f.Parent           = parent
+    vlist(7, f); pad(10, 14, 10, 10, f)
+    return f
+end
+
+-- Section divider with coloured label
+local function makeSection(parent, text, order, col)
+    local wrap = Instance.new("Frame")
+    wrap.Size             = UDim2.new(1, 0, 0, 22)
+    wrap.BackgroundTransparency = 1
+    wrap.LayoutOrder      = order
+    wrap.Parent           = parent
+    local sep = Instance.new("Frame")
+    sep.Size              = UDim2.new(1, 0, 0, 1)
+    sep.Position          = UDim2.new(0, 0, 1, -1)
+    sep.BackgroundColor3  = col
+    sep.BackgroundTransparency = 0.6
+    sep.BorderSizePixel   = 0
+    sep.Parent            = wrap
+    local lbl = Instance.new("TextLabel")
+    lbl.Text              = string.upper(text)
+    lbl.Font              = Enum.Font.GothamBold
+    lbl.TextSize          = 9
+    lbl.TextColor3        = col
+    lbl.BackgroundTransparency = 1
+    lbl.Size              = UDim2.new(1, 0, 1, 0)
+    lbl.TextXAlignment    = Enum.TextXAlignment.Left
+    lbl.Parent            = wrap
+    return wrap
+end
+
+-- Card row with left accent stripe
+local function makeRow(parent, labelText, order, col)
+    local row = Instance.new("Frame")
+    row.Size             = UDim2.new(1, 0, 0, 40)
+    row.BackgroundColor3 = CARD
+    row.BorderSizePixel  = 0
+    row.LayoutOrder      = order
+    row.Parent           = parent
+    corner(10, row)
+    newStroke(col, 0.9, row)
+    -- left coloured stripe
+    local stripe = Instance.new("Frame")
+    stripe.Size            = UDim2.new(0, 3, 0.55, 0)
+    stripe.Position        = UDim2.new(0, 0, 0.225, 0)
+    stripe.BackgroundColor3= col
+    stripe.BorderSizePixel = 0
+    stripe.Parent          = row
+    corner(3, stripe)
+    local lbl = Instance.new("TextLabel")
+    lbl.Text               = labelText
+    lbl.Font               = Enum.Font.Gotham
+    lbl.TextSize           = 12
+    lbl.TextColor3         = MUTED
+    lbl.BackgroundTransparency = 1
+    lbl.Size               = UDim2.new(0.55, 0, 1, 0)
+    lbl.Position           = UDim2.new(0, 14, 0, 0)
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+    lbl.Parent             = row
+    return row
+end
+
+-- Toggle switch
+local function makeToggle(parent, isOn, onCol)
+    local bg = Instance.new("Frame")
+    bg.Size             = UDim2.new(0, 44, 0, 22)
+    bg.Position         = UDim2.new(1, -50, 0.5, -11)
+    bg.BackgroundColor3 = isOn and onCol or TOGOFF
+    bg.BorderSizePixel  = 0
+    bg.Parent           = parent
+    corner(11, bg)
+    local bgS = newStroke(isOn and onCol or DIM, 1, bg)
+    local knob = Instance.new("Frame")
+    knob.Size            = UDim2.new(0, 16, 0, 16)
+    knob.Position        = isOn and UDim2.new(1,-19,0.5,-8) or UDim2.new(0,3,0.5,-8)
+    knob.BackgroundColor3= WHITE
+    knob.BorderSizePixel = 0
+    knob.Parent          = bg
+    corner(8, knob)
+    local btn = Instance.new("TextButton")
+    btn.Size                  = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency= 1
+    btn.Text                  = ""
+    btn.Parent                = bg
+    local function setOn(on)
+        tw(bg,   0.16, {BackgroundColor3 = on and onCol or TOGOFF})
+        tw(knob, 0.16, {Position = on and UDim2.new(1,-19,0.5,-8) or UDim2.new(0,3,0.5,-8)})
+        tw(bgS,  0.16, {Color = on and onCol or DIM})
+    end
+    return btn, setOn
+end
+
+-- ON/OFF state badge
+local function makeStateBadge(parent)
+    local l = Instance.new("TextLabel")
+    l.Text                = "OFF"
+    l.Font                = Enum.Font.GothamBold
+    l.TextSize            = 10
+    l.TextColor3          = DIM
+    l.BackgroundTransparency = 1
+    l.Size                = UDim2.new(0, 30, 0, 16)
+    l.Position            = UDim2.new(1, -86, 0.5, -8)
+    l.TextXAlignment      = Enum.TextXAlignment.Right
+    l.Parent              = parent
+    return l
+end
+
+-- Glowing status pill at bottom of tab
+local function makeStatusPill(parent, order, col)
+    local bar = Instance.new("Frame")
+    bar.Size             = UDim2.new(1, 0, 0, 28)
+    bar.BackgroundColor3 = INPUTBG
+    bar.BorderSizePixel  = 0
+    bar.LayoutOrder      = order
+    bar.Parent           = parent
+    corner(9, bar)
+    newStroke(col, 0.8, bar)
+    local dot = Instance.new("Frame")
+    dot.Size             = UDim2.new(0, 7, 0, 7)
+    dot.Position         = UDim2.new(0, 9, 0.5, -3.5)
+    dot.BackgroundColor3 = col
+    dot.BorderSizePixel  = 0
+    dot.Parent           = bar
+    corner(4, dot)
+    local lbl = Instance.new("TextLabel")
+    lbl.Font                  = Enum.Font.Gotham
+    lbl.TextSize              = 11
+    lbl.TextColor3            = MUTED
+    lbl.BackgroundTransparency= 1
+    lbl.Size                  = UDim2.new(1, -24, 1, 0)
+    lbl.Position              = UDim2.new(0, 22, 0, 0)
+    lbl.TextXAlignment        = Enum.TextXAlignment.Left
+    lbl.Parent                = bar
+    return lbl, dot
+end
+
+-- URL text-box
+local function makeUrlBox(parent, defaultText, order, col)
+    local box = Instance.new("TextBox")
+    box.Text                = defaultText
+    box.Font                = Enum.Font.Gotham
+    box.TextSize            = 10
+    box.TextColor3          = WHITE
+    box.PlaceholderText     = "Paste Discord webhook URL..."
+    box.PlaceholderColor3   = DIM
+    box.BackgroundColor3    = INPUTBG
+    box.BorderSizePixel     = 0
+    box.ClearTextOnFocus    = false
+    box.TextWrapped         = false
+    box.TextTruncate        = Enum.TextTruncate.AtEnd
+    box.Size                = UDim2.new(1, 0, 0, 30)
+    box.LayoutOrder         = order
+    box.Parent              = parent
+    corner(8, box)
+    local s = newStroke(DIM, 1, box)
+    box.Focused:Connect(function()   tw(s, 0.15, {Color = col}) end)
+    box.FocusLost:Connect(function() tw(s, 0.15, {Color = DIM}) end)
+    return box
+end
+
+-- ± stepper button
+local function makeAdjBtn(parent, symbol, posX, callback, col)
+    local btn = Instance.new("TextButton")
+    btn.Text             = symbol
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 18
+    btn.TextColor3       = WHITE
+    btn.BackgroundColor3 = CARD
+    btn.BorderSizePixel  = 0
+    btn.Size             = UDim2.new(0, 34, 0, 28)
+    btn.Position         = UDim2.new(0, posX, 0.5, -14)
+    btn.Parent           = parent
+    corner(8, btn)
+    newStroke(col, 1, btn)
+    btn.MouseEnter:Connect(function() tw(btn, 0.12, {BackgroundColor3 = col}) end)
+    btn.MouseLeave:Connect(function() tw(btn, 0.12, {BackgroundColor3 = CARD}) end)
+    btn.MouseButton1Click:Connect(callback)
+    return btn
+end
+
+-- Big action button
+local function makeActionBtn(parent, text, order, col, glowCol)
+    local btn = Instance.new("TextButton")
+    btn.Text             = text
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 13
+    btn.TextColor3       = WHITE
+    btn.BackgroundColor3 = col
+    btn.BorderSizePixel  = 0
+    btn.Size             = UDim2.new(1, 0, 0, 34)
+    btn.LayoutOrder      = order
+    btn.Parent           = parent
+    corner(10, btn)
+    newStroke(glowCol or col, 1.2, btn)
+    btn.MouseEnter:Connect(function() tw(btn, 0.13, {BackgroundColor3 = glowCol or col}) end)
+    btn.MouseLeave:Connect(function() tw(btn, 0.13, {BackgroundColor3 = col}) end)
+    return btn
+end
+
+-- ════════════════════════════════════════════════════════════
+--  ⚔  SPAMMER TAB  —  Crimson / Ember
+-- ════════════════════════════════════════════════════════════
+local TS = THEME.spam
+local spamContent = makeContentFrame(bodyArea)
+spamContent.Visible = true
+
+makeSection(spamContent, "Movement", 0, TS.pri)
+
+local row1 = makeRow(spamContent, "Move Mode:", 1, TS.pri)
+local tweenBtn, setTweenVis = makeToggle(row1, true, TS.pri)
+local modeLabel = makeStateBadge(row1)
+modeLabel.Text = "Tween"; modeLabel.TextColor3 = TS.sub
+tweenBtn.MouseButton1Click:Connect(function()
+    useTween = not useTween; setTweenVis(useTween)
+    modeLabel.Text      = useTween and "Tween" or "Warp"
+    modeLabel.TextColor3= useTween and TS.sub or Color3.fromRGB(255, 170, 60)
+end)
+
+local row2 = makeRow(spamContent, "Go Behind Boss:", 2, TS.pri)
+local goToggleBtn, setGoVis = makeToggle(row2, false, TS.pri)
+local goLabel = makeStateBadge(row2)
+goToggleBtn.MouseButton1Click:Connect(function()
+    goActive = not goActive; setGoVis(goActive)
+    goLabel.Text      = goActive and "ON" or "OFF"
+    goLabel.TextColor3= goActive and TS.good or DIM
+end)
+
+makeSection(spamContent, "Combat", 3, TS.pri)
+
+-- ── Auto Spam toggle row ──────────────────────────────────────
+local row3 = makeRow(spamContent, "Auto Spam:", 4, TS.pri)
+local spamToggleBtn, setSpamVis = makeToggle(row3, false, TS.pri)
+local spamLabel = makeStateBadge(row3)
+spamToggleBtn.MouseButton1Click:Connect(function()
+    spamActive = not spamActive; setSpamVis(spamActive)
+    spamLabel.Text      = spamActive and "ON" or "OFF"
+    spamLabel.TextColor3= spamActive and TS.bad or DIM
+end)
+
+-- ── Selectable remote buttons ─────────────────────────────────
+local remoteSelectFrame = Instance.new("Frame")
+remoteSelectFrame.Size             = UDim2.new(1, 0, 0, 0)
+remoteSelectFrame.AutomaticSize    = Enum.AutomaticSize.Y
+remoteSelectFrame.BackgroundColor3 = CARD
+remoteSelectFrame.BorderSizePixel  = 0
+remoteSelectFrame.LayoutOrder      = 5
+remoteSelectFrame.Parent           = spamContent
+corner(10, remoteSelectFrame)
+newStroke(TS.pri, 0.7, remoteSelectFrame)
+pad(7, 7, 8, 8, remoteSelectFrame)
+
+-- UIListLayout must be added BEFORE children
+local remoteVList = Instance.new("UIListLayout")
+remoteVList.Padding   = UDim.new(0, 4)
+remoteVList.SortOrder = Enum.SortOrder.LayoutOrder
+remoteVList.Parent    = remoteSelectFrame
+
+local remoteSelectHeader = Instance.new("TextLabel")
+remoteSelectHeader.Text               = "SELECT ATTACKS TO SPAM"
+remoteSelectHeader.Font               = Enum.Font.GothamBold
+remoteSelectHeader.TextSize           = 9
+remoteSelectHeader.TextColor3         = TS.pri
+remoteSelectHeader.BackgroundTransparency = 1
+remoteSelectHeader.Size               = UDim2.new(1, 0, 0, 16)
+remoteSelectHeader.TextXAlignment     = Enum.TextXAlignment.Left
+remoteSelectHeader.LayoutOrder        = 0
+remoteSelectHeader.Parent             = remoteSelectFrame
+
+local remoteGrid = Instance.new("Frame")
+remoteGrid.Size             = UDim2.new(1, 0, 0, 0)
+remoteGrid.AutomaticSize    = Enum.AutomaticSize.Y
+remoteGrid.BackgroundTransparency = 1
+remoteGrid.LayoutOrder      = 1
+remoteGrid.Parent           = remoteSelectFrame
+
+local remoteGridLayout = Instance.new("UIGridLayout")
+remoteGridLayout.CellSize          = UDim2.new(0, 82, 0, 28)
+remoteGridLayout.CellPadding       = UDim2.new(0, 5, 0, 5)
+remoteGridLayout.HorizontalAlignment= Enum.HorizontalAlignment.Left
+remoteGridLayout.SortOrder         = Enum.SortOrder.LayoutOrder
+remoteGridLayout.Parent            = remoteGrid
+
+-- Build one pill button per remote entry
+local remoteSelectBtns = {}
+for i, remote in ipairs(SPAM_REMOTES) do
+    local pill = Instance.new("TextButton")
+    pill.Text             = remote.label
+    pill.Font             = Enum.Font.GothamBold
+    pill.TextSize         = 11
+    pill.TextColor3       = remote.selected and TS.bad or MUTED
+    pill.BackgroundColor3 = remote.selected and Color3.fromRGB(60, 14, 20) or Color3.fromRGB(22, 18, 35)
+    pill.BorderSizePixel  = 0
+    pill.LayoutOrder      = i
+    pill.Parent           = remoteGrid
+    corner(7, pill)
+    local pillStroke = newStroke(remote.selected and TS.pri or DIM, remote.selected and 1.2 or 0.7, pill)
+
+    pill.MouseButton1Click:Connect(function()
+        remote.selected = not remote.selected
+        tw(pill, 0.14, {
+            BackgroundColor3 = remote.selected and Color3.fromRGB(60, 14, 20) or Color3.fromRGB(22, 18, 35),
+            TextColor3       = remote.selected and TS.bad or MUTED,
+        })
+        tw(pillStroke, 0.14, {
+            Color = remote.selected and TS.pri or DIM,
+        })
+        pillStroke.Thickness = remote.selected and 1.2 or 0.7
+    end)
+    remoteSelectBtns[i] = pill
+end
+
+local row4 = makeRow(spamContent, "Auto Dio's Lair:", 6, TS.pri)
+local autoFireToggleBtn, setAutoFireVis = makeToggle(row4, false, TS.pri)
+local autoFireLabel = makeStateBadge(row4)
+autoFireToggleBtn.MouseButton1Click:Connect(function()
+    autoFireActive = not autoFireActive; setAutoFireVis(autoFireActive)
+    autoFireLabel.Text      = autoFireActive and "ON" or "OFF"
+    autoFireLabel.TextColor3= autoFireActive and Color3.fromRGB(255, 165, 50) or DIM
+end)
+
+local row4b = makeRow(spamContent, "Auto Jotaro's Lair:", 7, TS.pri)
+local autoFireNPCToggleBtn, setAutoFireNPCVis = makeToggle(row4b, false, TS.pri)
+local autoFireNPCLabel = makeStateBadge(row4b)
+autoFireNPCToggleBtn.MouseButton1Click:Connect(function()
+    autoFireNPCActive = not autoFireNPCActive; setAutoFireNPCVis(autoFireNPCActive)
+    autoFireNPCLabel.Text      = autoFireNPCActive and "ON" or "OFF"
+    autoFireNPCLabel.TextColor3= autoFireNPCActive and Color3.fromRGB(255, 165, 50) or DIM
+end)
+
+local row4c = makeRow(spamContent, "Auto Diavolo's Lair:", 8, TS.pri)
+local autoDiavoloToggleBtn, setAutoDiavoloVis = makeToggle(row4c, false, TS.pri)
+local autoDiavoloLabel = makeStateBadge(row4c)
+autoDiavoloToggleBtn.MouseButton1Click:Connect(function()
+    autoDiavoloActive = not autoDiavoloActive; setAutoDiavoloVis(autoDiavoloActive)
+    autoDiavoloLabel.Text      = autoDiavoloActive and "ON" or "OFF"
+    autoDiavoloLabel.TextColor3= autoDiavoloActive and Color3.fromRGB(255, 165, 50) or DIM
+end)
+
+makeSection(spamContent, "Stand", 9, TS.pri)
+
+local row5 = makeRow(spamContent, "Auto Summon:", 10, TS.pri)
+local autoSummonToggleBtn, setAutoSummonVis = makeToggle(row5, false, TS.pri)
+local autoSummonLabel = makeStateBadge(row5)
+autoSummonToggleBtn.MouseButton1Click:Connect(function()
+    autoSummonActive = not autoSummonActive; setAutoSummonVis(autoSummonActive)
+    autoSummonLabel.Text      = autoSummonActive and "ON" or "OFF"
+    autoSummonLabel.TextColor3= autoSummonActive and TS.bad or DIM
+end)
+
+summonCountLabel = Instance.new("TextLabel")
+summonCountLabel.Text                = "Fires: 0"
+summonCountLabel.Font                = Enum.Font.Gotham
+summonCountLabel.TextSize            = 10
+summonCountLabel.TextColor3          = DIM
+summonCountLabel.BackgroundTransparency = 1
+summonCountLabel.Size                = UDim2.new(1, 0, 0, 14)
+summonCountLabel.LayoutOrder         = 11
+summonCountLabel.TextXAlignment      = Enum.TextXAlignment.Right
+summonCountLabel.Parent              = spamContent
+
+-- ── Kill Timer section ───────────────────────────────────────
+makeSection(spamContent, "Kill Timer  (auto-reset on timeout)", 12, TS.pri)
+
+local killTimerRow = makeRow(spamContent, "Kill Timer:", 13, TS.pri)
+local killTimerStateLabel = makeStateBadge(killTimerRow)
+local killTimerToggleBtn, setKillTimerVis = makeToggle(killTimerRow, false, TS.pri)
+killTimerToggleBtn.MouseButton1Click:Connect(function()
+    killTimerActive = not killTimerActive
+    setKillTimerVis(killTimerActive)
+    killTimerStateLabel.Text       = killTimerActive and "ON" or "OFF"
+    killTimerStateLabel.TextColor3 = killTimerActive and TS.bad or DIM
+    if not killTimerActive then killTimerStart = nil end
+end)
+
+local killDurRow = Instance.new("Frame")
+killDurRow.Size             = UDim2.new(1, 0, 0, 38)
+killDurRow.BackgroundColor3 = CARD
+killDurRow.BorderSizePixel  = 0
+killDurRow.LayoutOrder      = 14
+killDurRow.Parent           = spamContent
+corner(10, killDurRow); newStroke(TS.pri, 0.9, killDurRow)
+
+local kdMinusBtn = Instance.new("TextButton")
+kdMinusBtn.Text = "−"; kdMinusBtn.Font = Enum.Font.GothamBold; kdMinusBtn.TextSize = 18
+kdMinusBtn.TextColor3 = WHITE; kdMinusBtn.BackgroundColor3 = CARD; kdMinusBtn.BorderSizePixel = 0
+kdMinusBtn.Size = UDim2.new(0, 34, 0, 28); kdMinusBtn.Position = UDim2.new(0, 8, 0.5, -14)
+kdMinusBtn.Parent = killDurRow
+corner(8, kdMinusBtn); newStroke(TS.pri, 1, kdMinusBtn)
+kdMinusBtn.MouseEnter:Connect(function() tw(kdMinusBtn, 0.12, {BackgroundColor3 = TS.pri}) end)
+kdMinusBtn.MouseLeave:Connect(function() tw(kdMinusBtn, 0.12, {BackgroundColor3 = CARD}) end)
+
+local kdPlusBtn = Instance.new("TextButton")
+kdPlusBtn.Text = "+"; kdPlusBtn.Font = Enum.Font.GothamBold; kdPlusBtn.TextSize = 18
+kdPlusBtn.TextColor3 = WHITE; kdPlusBtn.BackgroundColor3 = CARD; kdPlusBtn.BorderSizePixel = 0
+kdPlusBtn.Size = UDim2.new(0, 34, 0, 28); kdPlusBtn.Position = UDim2.new(1, -42, 0.5, -14)
+kdPlusBtn.Parent = killDurRow
+corner(8, kdPlusBtn); newStroke(TS.pri, 1, kdPlusBtn)
+kdPlusBtn.MouseEnter:Connect(function() tw(kdPlusBtn, 0.12, {BackgroundColor3 = TS.pri}) end)
+kdPlusBtn.MouseLeave:Connect(function() tw(kdPlusBtn, 0.12, {BackgroundColor3 = CARD}) end)
+
+local kdLabel = Instance.new("TextButton")
+kdLabel.Text = "60s"; kdLabel.Font = Enum.Font.GothamBold; kdLabel.TextSize = 18
+kdLabel.TextColor3 = TS.text; kdLabel.BackgroundTransparency = 1; kdLabel.BorderSizePixel = 0
+kdLabel.Size = UDim2.new(1, -100, 1, 0); kdLabel.Position = UDim2.new(0, 50, 0, 0)
+kdLabel.TextXAlignment = Enum.TextXAlignment.Center; kdLabel.Parent = killDurRow
+
+local kdEditBox = Instance.new("TextBox")
+kdEditBox.Text = ""; kdEditBox.Font = Enum.Font.GothamBold; kdEditBox.TextSize = 18
+kdEditBox.TextColor3 = TS.text; kdEditBox.PlaceholderText = "type secs…"
+kdEditBox.PlaceholderColor3 = DIM; kdEditBox.BackgroundColor3 = INPUTBG
+kdEditBox.BorderSizePixel = 0; kdEditBox.ClearTextOnFocus = true; kdEditBox.Visible = false
+kdEditBox.Size = UDim2.new(1, -100, 1, 0); kdEditBox.Position = UDim2.new(0, 50, 0, 0)
+kdEditBox.TextXAlignment = Enum.TextXAlignment.Center; kdEditBox.Parent = killDurRow
+corner(6, kdEditBox); newStroke(TS.pri, 1.2, kdEditBox)
+
+kdLabel.MouseButton1Click:Connect(function()
+    kdLabel.Visible = false; kdEditBox.Visible = true
+    kdEditBox.Text = ""; kdEditBox:CaptureFocus()
+end)
+kdEditBox.FocusLost:Connect(function(entered)
+    local v = tonumber(kdEditBox.Text)
+    if entered and v and v >= 1 then
+        killTimerDuration = math.floor(v)
+        kdLabel.Text = tostring(killTimerDuration) .. "s"
+    end
+    kdEditBox.Visible = false; kdLabel.Visible = true; kdEditBox.Text = ""
+end)
+
+local KD_STEPS = {15, 30, 45, 60, 90, 120, 180, 300, 600}
+local kdIndex = 4
+local function updateKdLabel()
+    kdLabel.Text = tostring(KD_STEPS[kdIndex]) .. "s"
+    killTimerDuration = KD_STEPS[kdIndex]
+end
+kdMinusBtn.MouseButton1Click:Connect(function()
+    if kdIndex > 1 then kdIndex -= 1; updateKdLabel() end
+end)
+kdPlusBtn.MouseButton1Click:Connect(function()
+    if kdIndex < #KD_STEPS then kdIndex += 1; updateKdLabel() end
+end)
+
+local killTimerPillLbl, killTimerPillDot = makeStatusPill(spamContent, 15, TS.pri)
+killTimerPillLbl.Text = "Kill timer: OFF"
+killTimerLabel = killTimerPillLbl
+
+local statusTxt, statusDot = makeStatusPill(spamContent, 16, TS.pri)
+statusTxt.Text = "Boss: searching..."
+
+-- ════════════════════════════════════════════════════════════
+--  🔔  WEBHOOK TAB  —  Sapphire / Cyan
+-- ════════════════════════════════════════════════════════════
+local TW = THEME.webhook
+local webhookContent = makeContentFrame(bodyArea)
+
+makeSection(webhookContent, "Webhook URL", 1, TW.pri)
+local urlBox = makeUrlBox(webhookContent, webhookURL, 2, TW.pri)
+urlBox.FocusLost:Connect(function() webhookURL = urlBox.Text end)
+
+makeSection(webhookContent, "Send Interval  (seconds)", 3, TW.pri)
+
+local intervalRow = Instance.new("Frame")
+intervalRow.Size             = UDim2.new(1, 0, 0, 38)
+intervalRow.BackgroundColor3 = CARD
+intervalRow.BorderSizePixel  = 0
+intervalRow.LayoutOrder      = 4
+intervalRow.Parent           = webhookContent
+corner(10, intervalRow); newStroke(TW.pri, 0.9, intervalRow)
+
+-- − button on the left
+local iMinusBtn = Instance.new("TextButton")
+iMinusBtn.Text             = "−"
+iMinusBtn.Font             = Enum.Font.GothamBold
+iMinusBtn.TextSize         = 18
+iMinusBtn.TextColor3       = WHITE
+iMinusBtn.BackgroundColor3 = CARD
+iMinusBtn.BorderSizePixel  = 0
+iMinusBtn.Size             = UDim2.new(0, 34, 0, 28)
+iMinusBtn.Position         = UDim2.new(0, 8, 0.5, -14)
+iMinusBtn.Parent           = intervalRow
+corner(8, iMinusBtn); newStroke(TW.pri, 1, iMinusBtn)
+iMinusBtn.MouseEnter:Connect(function() tw(iMinusBtn, 0.12, {BackgroundColor3 = TW.pri}) end)
+iMinusBtn.MouseLeave:Connect(function() tw(iMinusBtn, 0.12, {BackgroundColor3 = CARD}) end)
+
+-- + button on the right
+local iPlusBtn = Instance.new("TextButton")
+iPlusBtn.Text             = "+"
+iPlusBtn.Font             = Enum.Font.GothamBold
+iPlusBtn.TextSize         = 18
+iPlusBtn.TextColor3       = WHITE
+iPlusBtn.BackgroundColor3 = CARD
+iPlusBtn.BorderSizePixel  = 0
+iPlusBtn.Size             = UDim2.new(0, 34, 0, 28)
+iPlusBtn.Position         = UDim2.new(1, -42, 0.5, -14)
+iPlusBtn.Parent           = intervalRow
+corner(8, iPlusBtn); newStroke(TW.pri, 1, iPlusBtn)
+iPlusBtn.MouseEnter:Connect(function() tw(iPlusBtn, 0.12, {BackgroundColor3 = TW.pri}) end)
+iPlusBtn.MouseLeave:Connect(function() tw(iPlusBtn, 0.12, {BackgroundColor3 = CARD}) end)
+
+-- Clickable label in the centre — click to type a custom value
+local intervalLabel = Instance.new("TextButton")
+intervalLabel.Text               = "60s"
+intervalLabel.Font               = Enum.Font.GothamBold
+intervalLabel.TextSize           = 18
+intervalLabel.TextColor3         = TW.text
+intervalLabel.BackgroundTransparency = 1
+intervalLabel.BorderSizePixel    = 0
+intervalLabel.Size               = UDim2.new(1, -100, 1, 0)
+intervalLabel.Position           = UDim2.new(0, 50, 0, 0)
+intervalLabel.TextXAlignment     = Enum.TextXAlignment.Center
+intervalLabel.Parent             = intervalRow
+
+-- Hidden TextBox that activates when the label is clicked
+local iEditBox = Instance.new("TextBox")
+iEditBox.Text               = ""
+iEditBox.Font               = Enum.Font.GothamBold
+iEditBox.TextSize           = 18
+iEditBox.TextColor3         = TW.text
+iEditBox.PlaceholderText    = "type secs…"
+iEditBox.PlaceholderColor3  = DIM
+iEditBox.BackgroundColor3   = INPUTBG
+iEditBox.BorderSizePixel    = 0
+iEditBox.ClearTextOnFocus   = true
+iEditBox.Visible            = false
+iEditBox.Size               = UDim2.new(1, -100, 1, 0)
+iEditBox.Position           = UDim2.new(0, 50, 0, 0)
+iEditBox.TextXAlignment     = Enum.TextXAlignment.Center
+iEditBox.Parent             = intervalRow
+corner(6, iEditBox); local iEditS = newStroke(TW.pri, 1.2, iEditBox)
+
+intervalLabel.MouseButton1Click:Connect(function()
+    intervalLabel.Visible = false
+    iEditBox.Visible      = true
+    iEditBox.Text         = ""
+    iEditBox:CaptureFocus()
+end)
+iEditBox.FocusLost:Connect(function(entered)
+    local v = tonumber(iEditBox.Text)
+    if entered and v and v >= 1 then
+        webhookInterval       = math.floor(v)
+        intervalLabel.Text    = tostring(webhookInterval) .. "s"
+    end
+    iEditBox.Visible      = false
+    intervalLabel.Visible = true
+    iEditBox.Text         = ""
+end)
+
+local STEPS     = {5, 10, 15, 30, 60, 120, 300, 600}
+local stepIndex = 5
+local function updateIntervalLabel()
+    intervalLabel.Text = tostring(STEPS[stepIndex]) .. "s"
+    webhookInterval    = STEPS[stepIndex]
+end
+iMinusBtn.MouseButton1Click:Connect(function()
+    if stepIndex > 1 then stepIndex -= 1; updateIntervalLabel() end
+end)
+iPlusBtn.MouseButton1Click:Connect(function()
+    if stepIndex < #STEPS then stepIndex += 1; updateIntervalLabel() end
+end)
+
+makeSection(webhookContent, "Auto-Send", 5, TW.pri)
+
+local autoRow   = makeRow(webhookContent, "Auto-Send:", 6, TW.pri)
+local autoStatL = makeStateBadge(autoRow)
+local webhookToggleBtn, setWebhookVis = makeToggle(autoRow, false, TW.pri)
+webhookToggleBtn.MouseButton1Click:Connect(function()
+    webhookActive = not webhookActive; setWebhookVis(webhookActive)
+    autoStatL.Text      = webhookActive and "ON" or "OFF"
+    autoStatL.TextColor3= webhookActive and TW.good or DIM
+    if webhookActive then lastWebhookSend = 0 end
+end)
+
+local sendNowBtn = makeActionBtn(webhookContent, "⚡  Send Now", 7,
+    Color3.fromRGB(25, 110, 195), TW.pri)
+sendNowBtn.MouseButton1Click:Connect(function()
+    sendNowBtn.Text = "Sending..."
+    task.spawn(function()
+        local ok, msg = sendWebhook()
+        sendNowBtn.Text = ok and "✓  Sent!" or ("✗  " .. msg)
+        task.wait(2); sendNowBtn.Text = "⚡  Send Now"
+    end)
+end)
+
+webhookCountLabel = makeStatusPill(webhookContent, 8, TW.pri)
+webhookCountLabel.Text = "Sent: 0"
+
+-- ════════════════════════════════════════════════════════════
+--  ✦  STAND ROLL TAB  —  Royal Violet / Gold
+-- ════════════════════════════════════════════════════════════
+local TR = THEME.stand
+local standContent = makeContentFrame(bodyArea)
+
+makeSection(standContent, "Alert Webhook URL", 1, TR.pri)
+local standUrlBox = makeUrlBox(standContent, standWebhookURL, 2, TR.pri)
+standUrlBox.FocusLost:Connect(function() standWebhookURL = standUrlBox.Text end)
+
+makeSection(standContent, "Mention User ID  (optional)", 3, TR.pri)
+
+local mentionIdBox = Instance.new("TextBox")
+mentionIdBox.Text               = ""
+mentionIdBox.Font               = Enum.Font.Gotham
+mentionIdBox.TextSize           = 11
+mentionIdBox.TextColor3         = WHITE
+mentionIdBox.PlaceholderText    = "Discord User ID  e.g. 123456789012345678"
+mentionIdBox.PlaceholderColor3  = DIM
+mentionIdBox.BackgroundColor3   = INPUTBG
+mentionIdBox.BorderSizePixel    = 0
+mentionIdBox.ClearTextOnFocus   = false
+mentionIdBox.TextWrapped        = false
+mentionIdBox.TextTruncate       = Enum.TextTruncate.AtEnd
+mentionIdBox.Size               = UDim2.new(1, 0, 0, 30)
+mentionIdBox.LayoutOrder        = 4
+mentionIdBox.Parent             = standContent
+corner(8, mentionIdBox)
+local mentionIdS = newStroke(DIM, 1, mentionIdBox)
+mentionIdBox.Focused:Connect(function()    tw(mentionIdS, 0.15, {Color = TR.pri}) end)
+mentionIdBox.FocusLost:Connect(function()
+    tw(mentionIdS, 0.15, {Color = DIM})
+    standMentionID = mentionIdBox.Text:match("^%s*(.-)%s*$") or ""
+end)
+
+makeSection(standContent, "Stop On  (comma-separated)", 5, TR.pri)
+
+local stopListBox = Instance.new("TextBox")
+stopListBox.Text               = table.concat(standStopList, ", ")
+stopListBox.Font               = Enum.Font.Gotham
+stopListBox.TextSize           = 11
+stopListBox.TextColor3         = TR.text
+stopListBox.PlaceholderText    = "e.g. Legendary, Hacker"
+stopListBox.PlaceholderColor3  = DIM
+stopListBox.BackgroundColor3   = INPUTBG
+stopListBox.BorderSizePixel    = 0
+stopListBox.ClearTextOnFocus   = false
+stopListBox.TextWrapped        = false
+stopListBox.TextTruncate       = Enum.TextTruncate.AtEnd
+stopListBox.Size               = UDim2.new(1, 0, 0, 30)
+stopListBox.LayoutOrder        = 6
+stopListBox.Parent             = standContent
+corner(8, stopListBox)
+local slS = newStroke(DIM, 1, stopListBox)
+stopListBox.Focused:Connect(function()    tw(slS, 0.15, {Color = TR.pri}) end)
+stopListBox.FocusLost:Connect(function()
+    tw(slS, 0.15, {Color = DIM})
+    standStopList = {}
+    for word in string.gmatch(stopListBox.Text, "([^,]+)") do
+        local t = word:match("^%s*(.-)%s*$")
+        if t ~= "" then table.insert(standStopList, t) end
+    end
+end)
+
+makeSection(standContent, "Loop Cooldown  (seconds)", 7, TR.pri)
+
+local coolRow = Instance.new("Frame")
+coolRow.Size             = UDim2.new(1, 0, 0, 38)
+coolRow.BackgroundColor3 = CARD
+coolRow.BorderSizePixel  = 0
+coolRow.LayoutOrder      = 8
+coolRow.Parent           = standContent
+corner(10, coolRow); newStroke(TR.pri, 0.9, coolRow)
+
+-- − button on the left
+local cMinusBtn = Instance.new("TextButton")
+cMinusBtn.Text             = "−"
+cMinusBtn.Font             = Enum.Font.GothamBold
+cMinusBtn.TextSize         = 18
+cMinusBtn.TextColor3       = WHITE
+cMinusBtn.BackgroundColor3 = CARD
+cMinusBtn.BorderSizePixel  = 0
+cMinusBtn.Size             = UDim2.new(0, 34, 0, 28)
+cMinusBtn.Position         = UDim2.new(0, 8, 0.5, -14)
+cMinusBtn.Parent           = coolRow
+corner(8, cMinusBtn); newStroke(TR.pri, 1, cMinusBtn)
+cMinusBtn.MouseEnter:Connect(function() tw(cMinusBtn, 0.12, {BackgroundColor3 = TR.pri}) end)
+cMinusBtn.MouseLeave:Connect(function() tw(cMinusBtn, 0.12, {BackgroundColor3 = CARD}) end)
+
+-- + button on the right
+local cPlusBtn = Instance.new("TextButton")
+cPlusBtn.Text             = "+"
+cPlusBtn.Font             = Enum.Font.GothamBold
+cPlusBtn.TextSize         = 18
+cPlusBtn.TextColor3       = WHITE
+cPlusBtn.BackgroundColor3 = CARD
+cPlusBtn.BorderSizePixel  = 0
+cPlusBtn.Size             = UDim2.new(0, 34, 0, 28)
+cPlusBtn.Position         = UDim2.new(1, -42, 0.5, -14)
+cPlusBtn.Parent           = coolRow
+corner(8, cPlusBtn); newStroke(TR.pri, 1, cPlusBtn)
+cPlusBtn.MouseEnter:Connect(function() tw(cPlusBtn, 0.12, {BackgroundColor3 = TR.pri}) end)
+cPlusBtn.MouseLeave:Connect(function() tw(cPlusBtn, 0.12, {BackgroundColor3 = CARD}) end)
+
+-- Label centered between the two buttons
+local coolLabel = Instance.new("TextLabel")
+coolLabel.Text               = tostring(standLoopCooldown) .. "s"
+coolLabel.Font               = Enum.Font.GothamBold
+coolLabel.TextSize           = 18
+coolLabel.TextColor3         = TR.text
+coolLabel.BackgroundTransparency = 1
+coolLabel.Size               = UDim2.new(1, -100, 1, 0)
+coolLabel.Position           = UDim2.new(0, 50, 0, 0)
+coolLabel.TextXAlignment     = Enum.TextXAlignment.Center
+coolLabel.Parent             = coolRow
+
+local COOL_STEPS = {1, 2, 3, 5, 7, 10, 15, 20, 30}
+local coolIndex  = 4  -- default 5s
+local function updateCoolLabel()
+    coolLabel.Text      = tostring(COOL_STEPS[coolIndex]) .. "s"
+    standLoopCooldown   = COOL_STEPS[coolIndex]
+end
+cMinusBtn.MouseButton1Click:Connect(function()
+    if coolIndex > 1 then coolIndex -= 1; updateCoolLabel() end
+end)
+cPlusBtn.MouseButton1Click:Connect(function()
+    if coolIndex < #COOL_STEPS then coolIndex += 1; updateCoolLabel() end
+end)
+
+makeSection(standContent, "Auto-Roll", 9, TR.pri)
+
+local rollRow = makeRow(standContent, "Auto-Roll:", 10, TR.pri)
+standRollLabel = makeStateBadge(rollRow)
+local standToggleBtn, setStandVis = makeToggle(rollRow, false, TR.pri)
+_setStandVis = setStandVis
+
+standToggleBtn.MouseButton1Click:Connect(function()
+    standRollActive = not standRollActive
+    setStandVis(standRollActive)
+    standRollLabel.Text      = standRollActive and "ON" or "OFF"
+    standRollLabel.TextColor3= standRollActive and TR.good or DIM
+    if standRollActive then
+        standRollCount = 0
+        if standStatusLabel then
+            standStatusLabel.Text      = "Starting..."
+            standStatusLabel.TextColor3= TR.sub
+        end
+    end
+end)
+
+standStatusLabel = makeStatusPill(standContent, 11, TR.pri)
+standStatusLabel.Text = "Idle"
+
+-- ════════════════════════════════════════════════════════════
+--  📜  QUESTS TAB  —  Neon Green
+-- ════════════════════════════════════════════════════════════
+local TQ = THEME.quest
+local questContent = makeContentFrame(bodyArea)
+
+makeSection(questContent, "DIO Quest — Jotaro Part 4", 1, TQ.pri)
+
+-- Description card
+local questDescFrame = Instance.new("Frame")
+questDescFrame.Size             = UDim2.new(1, 0, 0, 0)
+questDescFrame.AutomaticSize    = Enum.AutomaticSize.Y
+questDescFrame.BackgroundColor3 = CARD
+questDescFrame.BorderSizePixel  = 0
+questDescFrame.LayoutOrder      = 2
+questDescFrame.Parent           = questContent
+corner(8, questDescFrame)
+newStroke(TQ.pri, 0.8, questDescFrame)
+local questDescPad = Instance.new("UIPadding")
+questDescPad.PaddingTop    = UDim.new(0, 8); questDescPad.PaddingBottom = UDim.new(0, 8)
+questDescPad.PaddingLeft   = UDim.new(0, 10); questDescPad.PaddingRight  = UDim.new(0, 10)
+questDescPad.Parent = questDescFrame
+
+local questDesc = Instance.new("TextLabel")
+questDesc.Text               = "Fires quest start → waits for Jotaro to be alive → teleports behind him → spams M1 until he dies → fires QuestDone → loops until toggled off."
+questDesc.Font               = Enum.Font.Gotham
+questDesc.TextSize           = 10
+questDesc.TextColor3         = TQ.sub
+questDesc.BackgroundTransparency = 1
+questDesc.Size               = UDim2.new(1, 0, 0, 0)
+questDesc.AutomaticSize      = Enum.AutomaticSize.Y
+questDesc.TextWrapped        = true
+questDesc.TextXAlignment     = Enum.TextXAlignment.Left
+questDesc.Parent             = questDescFrame
+
+makeSection(questContent, "Auto Quest", 3, TQ.pri)
+
+local questRow = makeRow(questContent, "Auto DIO Quest:", 4, TQ.pri)
+local questStateLabel = makeStateBadge(questRow)
+local questToggleBtn, setQuestVis = makeToggle(questRow, false, TQ.pri)
+
+questToggleBtn.MouseButton1Click:Connect(function()
+    questActive = not questActive
+    setQuestVis(questActive)
+    questStateLabel.Text      = questActive and "ON" or "OFF"
+    questStateLabel.TextColor3= questActive and TQ.good or DIM
+    if questActive then
+        if questStatusLabel then questStatusLabel.Text = "Starting quest loop..." end
+    else
+        if questStatusLabel then questStatusLabel.Text = "Stopped." end
+    end
+end)
+
+questStatusLabel = makeStatusPill(questContent, 5, TQ.pri)
+questStatusLabel.Text = "Idle"
+
+-- ════════════════════════════════════════════════════════════
+--  ⚡  AUTO QUEST TAB  —  Crimson / Ember
+-- ════════════════════════════════════════════════════════════
+local TAQ = THEME.autoquest
+local aqContent = makeContentFrame(bodyArea)
+
+makeSection(aqContent, "Quest Selector", 1, TAQ.pri)
+
+aqDropBtn = Instance.new("TextButton")
+aqDropBtn.Text = "▼  Choose a Quest..."; aqDropBtn.Font = Enum.Font.Gotham
+aqDropBtn.TextSize = 12; aqDropBtn.TextColor3 = TAQ.text
+aqDropBtn.BackgroundColor3 = CARD; aqDropBtn.BorderSizePixel = 0
+aqDropBtn.Size = UDim2.new(1, 0, 0, 34); aqDropBtn.LayoutOrder = 2
+aqDropBtn.TextXAlignment = Enum.TextXAlignment.Left; aqDropBtn.Parent = aqContent
+corner(9, aqDropBtn); newStroke(TAQ.pri, 1, aqDropBtn); pad(0, 0, 10, 10, aqDropBtn)
+
+local aqDropList = Instance.new("ScrollingFrame")
+aqDropList.Size = UDim2.new(1, 0, 0, 0); aqDropList.BackgroundColor3 = INPUTBG
+aqDropList.BorderSizePixel = 0; aqDropList.ScrollBarThickness = 3
+aqDropList.ScrollBarImageColor3 = TAQ.pri; aqDropList.ClipsDescendants = true
+aqDropList.Visible = false; aqDropList.LayoutOrder = 3; aqDropList.ZIndex = 10
+aqDropList.Parent = aqContent
+corner(8, aqDropList); newStroke(TAQ.pri, 0.8, aqDropList)
+
+local aqDropLayout = Instance.new("UIListLayout")
+aqDropLayout.SortOrder = Enum.SortOrder.LayoutOrder; aqDropLayout.Parent = aqDropList
+
+local aqDropOpen = false
+for i, quest in ipairs(AQ_QUESTS) do
+    local item = Instance.new("TextButton")
+    item.Size = UDim2.new(1, 0, 0, 30); item.BackgroundColor3 = CARD
+    item.BackgroundTransparency = 0.3; item.Text = "  " .. quest.name
+    item.TextColor3 = TAQ.text; item.Font = Enum.Font.Gotham; item.TextSize = 11
+    item.TextXAlignment = Enum.TextXAlignment.Left; item.BorderSizePixel = 0
+    item.LayoutOrder = i; item.ZIndex = 11; item.Parent = aqDropList
+    item.MouseEnter:Connect(function()
+        tw(item, 0.1, {BackgroundColor3 = TAQ.pri, BackgroundTransparency = 0.6})
+    end)
+    item.MouseLeave:Connect(function()
+        tw(item, 0.1, {BackgroundColor3 = CARD, BackgroundTransparency = 0.3})
+    end)
+    item.MouseButton1Click:Connect(function()
+        aqActiveQuest.value = quest
+        pcall(function() aqDropBtn.Text = "▼  " .. quest.name end)
+        aqDropOpen = false; aqDropList.Visible = false
+        tw(aqDropList, 0.18, {Size = UDim2.new(1, 0, 0, 0)})
+    end)
+end
+aqDropList.CanvasSize = UDim2.new(0, 0, 0, #AQ_QUESTS * 30)
+
+aqDropBtn.MouseButton1Click:Connect(function()
+    aqDropOpen = not aqDropOpen
+    aqDropList.Visible = true
+    local targetH = aqDropOpen and math.min(#AQ_QUESTS * 30, 150) or 0
+    tw(aqDropList, 0.18, {Size = UDim2.new(1, 0, 0, targetH)})
+    if not aqDropOpen then
+        task.delay(0.2, function() aqDropList.Visible = false end)
+    end
+end)
+
+makeSection(aqContent, "Attack Config", 4, TAQ.pri)
+
+local aqAtkDefs = {
+    { key = "M1",      label = "M1 Punch",   icon = "👊" },
+    { key = "Barrage", label = "Barrage",     icon = "⚡" },
+    { key = "Heavy",   label = "Heavy Punch", icon = "💥" },
+}
+local aqAtkOrder = 5
+for _, atk in ipairs(aqAtkDefs) do
+    local row = makeRow(aqContent, atk.icon .. "  " .. atk.label, aqAtkOrder, TAQ.pri)
+    local badge = makeStateBadge(row)
+    badge.Text = aqAttacks[atk.key] and "ON" or "OFF"
+    badge.TextColor3 = aqAttacks[atk.key] and TAQ.good or DIM
+    local atkBtn, setAtkVis = makeToggle(row, aqAttacks[atk.key], TAQ.pri)
+    atkBtn.MouseButton1Click:Connect(function()
+        aqAttacks[atk.key] = not aqAttacks[atk.key]
+        setAtkVis(aqAttacks[atk.key])
+        badge.Text = aqAttacks[atk.key] and "ON" or "OFF"
+        badge.TextColor3 = aqAttacks[atk.key] and TAQ.good or DIM
+    end)
+    aqAtkOrder += 1
+end
+
+makeSection(aqContent, "Smart Mode", aqAtkOrder, TAQ.pri)
+aqAtkOrder += 1
+
+local aqSmartRow = makeRow(aqContent, "🧠  Auto-pick by level:", aqAtkOrder, TAQ.pri)
+local aqSmartBadge = makeStateBadge(aqSmartRow)
+aqSmartBadge.Text = "OFF"
+local aqSmartBtn, setSmartVis = makeToggle(aqSmartRow, false, TAQ.pri)
+aqSmartBtn.MouseButton1Click:Connect(function()
+    aqSmartMode = not aqSmartMode
+    setSmartVis(aqSmartMode)
+    aqSmartBadge.Text = aqSmartMode and "ON" or "OFF"
+    aqSmartBadge.TextColor3 = aqSmartMode and TAQ.good or DIM
+    if aqSmartMode then
+        local smart = aqGetSmartQuest()
+        if smart then
+            aqActiveQuest.value = smart
+            pcall(function() aqDropBtn.Text = "▼  " .. smart.name end)
+        end
+    end
+end)
+aqAtkOrder += 1
+
+makeSection(aqContent, "Farming", aqAtkOrder, TAQ.pri)
+aqAtkOrder += 1
+
+local aqStartBtn = makeActionBtn(aqContent, "▶  START FARMING", aqAtkOrder,
+    Color3.fromRGB(180, 30, 50), TAQ.pri)
+aqAtkOrder += 1
+
+aqStartBtn.MouseButton1Click:Connect(function()
+    if aqRunning then
+        aqRunning = false
+        if aqFarmThread then task.cancel(aqFarmThread); aqFarmThread = nil end
+        aqStartBtn.Text = "▶  START FARMING"
+        tw(aqStartBtn, 0.2, {BackgroundColor3 = Color3.fromRGB(180, 30, 50)})
+        if aqStatusLabel then aqStatusLabel.Text = "Idle"; aqStatusLabel.TextColor3 = MUTED end
+    else
+        if aqSmartMode then
+            local smart = aqGetSmartQuest()
+            if smart then
+                aqActiveQuest.value = smart
+                pcall(function() aqDropBtn.Text = "▼  " .. smart.name end)
+            else
+                if aqStatusLabel then
+                    aqStatusLabel.Text = "⚠ Level too low for any quest!"
+                    aqStatusLabel.TextColor3 = TAQ.bad
+                end
+                return
+            end
+        else
+            if not aqActiveQuest.value then
+                if aqStatusLabel then
+                    aqStatusLabel.Text = "⚠ Select a quest first!"
+                    aqStatusLabel.TextColor3 = TAQ.bad
+                end
+                return
+            end
+        end
+        aqRunning = true
+        aqStartBtn.Text = "⏹  STOP FARMING"
+        tw(aqStartBtn, 0.2, {BackgroundColor3 = Color3.fromRGB(100, 20, 35)})
+        if aqStatusLabel then
+            local prefix = aqSmartMode and "Smart — " or "Farming — "
+            aqStatusLabel.Text = prefix .. (aqActiveQuest.value and aqActiveQuest.value.name or "?")
+            aqStatusLabel.TextColor3 = TAQ.good
+        end
+        aqFarmThread = task.spawn(function() aqRunQuest(aqActiveQuest.value) end)
+    end
+end)
+
+aqStatusLabel = makeStatusPill(aqContent, aqAtkOrder, TAQ.pri)
+aqStatusLabel.Text = "Idle"
+
+local function switchTab(tab)
+    spamContent.Visible    = (tab == "spam")
+    webhookContent.Visible = (tab == "webhook")
+    standContent.Visible   = (tab == "stand")
+    questContent.Visible   = (tab == "quest")
+    aqContent.Visible      = (tab == "autoquest")
+
+    local th = THEME[tab]
+
+    -- morph frame chrome
+    tw(frameBorder, 0.22, {Color = th.pri})
+    tw(glowFrame,   0.22, {BackgroundColor3 = th.pri})
+    tw(topCap,      0.22, {BackgroundColor3 = th.glow})
+    tw(titleLbl,    0.22, {TextColor3 = th.text})
+    tw(iconBadge,   0.22, {BackgroundColor3 = th.pri})
+
+    -- per-pill highlights
+    for name, p in pairs(tabPills) do
+        local on = (name == tab)
+        tw(p.btn,  0.18, {TextColor3 = on and p.col or DIM})
+        tw(p.pill, 0.18, {BackgroundTransparency = on and 0.80 or 1})
+        tw(p.line, 0.18, {BackgroundTransparency = on and 0    or 1})
+    end
+end
+
+switchTab("spam")   -- start on spam tab
+
+spamTabBtn.MouseButton1Click:Connect(function()    switchTab("spam")       end)
+webhookTabBtn.MouseButton1Click:Connect(function() switchTab("webhook")    end)
+standTabBtn.MouseButton1Click:Connect(function()   switchTab("stand")      end)
+questTabBtn.MouseButton1Click:Connect(function()   switchTab("quest")      end)
+aqTabBtn.MouseButton1Click:Connect(function()      switchTab("autoquest")  end)
+
+-- ════════════════════════════════════════════════════════════
+--  MINIMIZE / CLOSE
+-- ════════════════════════════════════════════════════════════
+local minimized = false
+
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    if minimized then
+        tabBg.Visible     = false
+        bodyArea.Visible  = false
+        tw(frame,     0.22, {Size = UDim2.new(0, PW, 0, 50)})
+        tw(glowFrame, 0.22, {Size = UDim2.new(0, PW + 20, 0, 62)})
+        minBtn.Text = "□"
+    else
+        tabBg.Visible    = true
+        bodyArea.Visible = true
+        tw(frame,     0.22, {Size = UDim2.new(0, PW, 0, PH)})
+        tw(glowFrame, 0.22, {Size = UDim2.new(0, PW + 20, 0, PH + 20)})
+        minBtn.Text = "—"
+    end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    spamActive = false; goActive = false; autoFireActive = false
+    autoSummonActive = false; webhookActive = false; standRollActive = false
+    questActive = false; autoFireNPCActive = false; autoDiavoloActive = false
+    killTimerActive = false; killTimerStart = nil
+    aqRunning = false; if aqFarmThread then task.cancel(aqFarmThread) end
+    if summonDeathConn then summonDeathConn:Disconnect() end
+    tw(frame,     0.18, {BackgroundTransparency = 1})
+    tw(glowFrame, 0.18, {BackgroundTransparency = 1})
+    task.wait(0.2); screenGui:Destroy()
+end)
+
+-- ════════════════════════════════════════════════════════════
+--  DRAGGING
+-- ════════════════════════════════════════════════════════════
+local dragging, dragStart, startPos = false, nil, nil
+
+titleBar.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = i.Position; startPos = frame.Position
+    end
+end)
+titleBar.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d  = i.Position - dragStart
+        local np = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                             startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        frame.Position     = np
+        glowFrame.Position = UDim2.new(np.X.Scale, np.X.Offset - 10,
+                                       np.Y.Scale, np.Y.Offset - 10)
+    end
+end)
+
+-- ════════════════════════════════════════════════════════════
+--  BOSS STATUS HEARTBEAT
+-- ════════════════════════════════════════════════════════════
+RunService.Heartbeat:Connect(function()
+    local model = getModel()
+    if not model then
+        statusTxt.Text      = "Boss: not found"
+        statusTxt.TextColor3= TS.bad
+        statusDot.BackgroundColor3 = TS.bad
+        return
+    end
+    local hum = getModelHumanoid(model)
+    if hum and hum.Health > 0 then
+        statusTxt.Text      = ("Boss HP: %d / %d"):format(math.floor(hum.Health), math.floor(hum.MaxHealth))
+        statusTxt.TextColor3= TS.good
+        statusDot.BackgroundColor3 = TS.good
+    else
+        statusTxt.Text      = "Boss: DEAD"
+        statusTxt.TextColor3= TS.bad
+        statusDot.BackgroundColor3 = TS.bad
+    end
+end)
